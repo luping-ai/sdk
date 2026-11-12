@@ -93,13 +93,31 @@ jobs:
             exit 1
           fi
 
-          # 带前缀的 tag：确认对应目录里真有 go.mod，避免拼错目录名。
+          # 带前缀的 tag：确认目录真实存在（目录名拼错就永远拉不到）。
           moddir="${tag%/v*}"
-          if [ ! -f "$moddir/go.mod" ]; then
-            echo "::error::tag '$tag' 指向的目录 '$moddir' 里没有 go.mod。"
-            echo "现有 Go 模块目录："
-            find . -name go.mod -not -path './.git/*' | sed 's|/go.mod$||' | sed 's|^\./|  |'
+          if [ ! -d "$moddir" ]; then
+            echo "::error::tag '$tag' 指向的目录 '$moddir' 不存在。"
+            echo "仓库现有目录："
+            find . -maxdepth 3 -type d -not -path './.git*' -not -name '*' | sed 's|^\./|  |'
             exit 1
           fi
 
-          echo "✓ tag '$tag' 格式正确（模块目录 $moddir）"
+          # 是 Go 模块目录时，必须是合法的模块路径形状。
+          #
+          # 注意不要要求"目录里一定有 go.mod"：未来的 local-ai-runtime-sdk/python/
+          # 之类目录没有 go.mod，tag 却是合法的。只在有 go.mod 时才检查。
+          if [ -f "$moddir/go.mod" ]; then
+            modpath=$(awk '/^module /{print $2; exit}' "$moddir/go.mod")
+            want="github.com/${GITHUB_REPOSITORY}/${moddir}"
+            if [ "$modpath" != "$want" ]; then
+              echo "::error::tag '$tag' 与模块路径不匹配。"
+              echo "  $moddir/go.mod 声明：$modpath"
+              echo "  tag 隐含的路径应为：$want"
+              echo ""
+              echo "两者必须一致，否则 go get 拉不到。"
+              exit 1
+            fi
+            echo "✓ tag '$tag' 格式正确（Go 模块 $modpath）"
+          else
+            echo "✓ tag '$tag' 格式正确（非 Go 目录，仅标记发布点）"
+          fi

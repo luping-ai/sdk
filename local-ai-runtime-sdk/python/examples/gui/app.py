@@ -196,7 +196,9 @@ class App(tk.Tk):
 
     def _on_busy_change(self, pending: int) -> None:
         if pending > 0:
-            self.status.busy(f"运行中（{pending} 个后台任务）…")
+            label = self.runner.current_label()
+            text = f"{label}（{pending}）" if label else f"运行中（{pending}）"
+            self.status.busy(text)
         else:
             self.status.idle()
 

@@ -187,12 +187,18 @@ class StatusBar(ttk.Frame):
         self._busy_text = ttk.Label(self, text="", style="Hint.TLabel")
         self._busy_text.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
-        self._pending = 0
+        self._progress_running = False
+        # 忙碌期间被暂存的消息（任务结束时显示）
+        self._pending_msg: Optional[tuple[str, str]] = None
 
     def _set(self, text: str, kind: str = "info") -> None:
-        if self._pending > 0:
-            # 有后台任务时不要覆盖忙碌提示，否则用户会以为操作结束了
+        if self._progress_running:
+            # 忙碌期间不覆盖忙碌提示，但**要记住**这条消息：任务结束时
+            # 由 idle() 显示出来。早期版本直接 return 丢掉，导致
+            # 「生成完成」这类结果提示永远不出现——用户以为没成功。
+            self._pending_msg = (text, kind)
             return
+        self._pending_msg = None
         self._msg.configure(text=text, style=self._STYLES.get(kind, "Hint.TLabel"))
 
     def info(self, text: str) -> None:
@@ -208,19 +214,39 @@ class StatusBar(ttk.Frame):
         self._set(text, "error")
 
     def busy(self, text: str = "运行中…") -> None:
-        self._pending += 1
+        """进入忙碌态。
+
+        **不是计数器**：忙不忙由 TaskRunner 的 pending 决定，这里只是
+        开关。曾经做成计数（busy 加一、idle 减一），结果面板手动调
+        busy 而 TaskRunner 也调，加了两次只减一次，进度条永远转下去。
+
+        现在语义很明确：调用者只有 app._on_busy_change 一处，它直接
+        转发 TaskRunner 的 pending。重复调用只是刷新文字，不会叠加。
+        """
         self._busy_text.configure(text=text)
         self._msg.configure(text="")
         self._progress.grid()
-        self._progress.start(12)
+        if not self._progress_running:
+            self._progress.start(12)
+            self._progress_running = True
 
     def idle(self) -> None:
-        self._pending = max(0, self._pending - 1)
-        if self._pending > 0:
-            return
+        """退出忙碌态。可重复调用。
+
+        若忙碌期间有消息被暂存（见 _set），在这里显示出来——否则
+        「生成完成」「已导入」这类结果提示会永久消失。
+        """
         self._progress.stop()
+        self._progress_running = False
         self._progress.grid_remove()
         self._busy_text.configure(text="")
+
+        pending = self._pending_msg
+        self._pending_msg = None
+        if pending is not None:
+            text, kind = pending
+            self._msg.configure(
+                text=text, style=self._STYLES.get(kind, "Hint.TLabel"))
 
 
 class BusyButton(ttk.Button):

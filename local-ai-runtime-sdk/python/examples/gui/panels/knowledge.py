@@ -289,8 +289,8 @@ class KnowledgePanel(ttk.Frame):
             self._app.status.error("导入失败")
             self._app.notify_error(exc)
 
-        self._app.status.busy("导入中（解析 + 切片）…")
-        self._app.runner.submit(work, on_done=done, on_error=error)
+        self._app.runner.submit(work, on_done=done, on_error=error,
+                                busy_text="导入中（解析 + 切片）")
 
     def _do_list_docs(self) -> None:
         kb_id = self._need_kb()
@@ -441,8 +441,8 @@ class KnowledgePanel(ttk.Frame):
             self._app.status.error("问答失败")
             self._app.notify_error(exc)
 
-        self._app.status.busy("检索并生成…")
-        self._app.runner.submit(work, on_done=done, on_error=error)
+        self._app.runner.submit(work, on_done=done, on_error=error,
+                                busy_text="检索并生成")
 
     # -- 清理 ----------------------------------------------------------
 

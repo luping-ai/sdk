@@ -52,6 +52,8 @@ class TaskRunner:
         # 里的 Progressbar.stop() 在非主线程碰了 tkinter，抛
         # RuntimeError: main thread is not in main loop。
         self._busy_events: queue.Queue[int] = queue.Queue()
+        # 每个任务的说明文字（与 _pending 同步增减），用于状态栏
+        self._labels: list[str] = []
         self._pending = 0
         self._reported = 0
         self._listeners: list[Callable[[int], None]] = []
@@ -81,6 +83,48 @@ class TaskRunner:
         # 不在当前线程回调，只投递；由主线程的 poll 派发
         self._busy_events.put(n)
 
+    # -- 不走 submit 的自定义任务 ---------------------------------------
+
+    def begin(self, label: str = "") -> None:
+        """手动标记一个任务开始。**必须**与 end(label) 配对。
+
+        给那些不能用 submit 的场景用——典型是流式对话：它需要自己
+        控制线程，且忙碌期间「停止」按钮必须可用（submit 会把所有
+        BusyButton 禁用）。
+
+        为什么要走这一对而不是直接调 status.busy()：状态栏只认
+        TaskRunner 的 pending 计数。绕过它去开关状态栏，就会在多个
+        任务并行时互相覆盖——A 结束把 B 的忙碌指示也关掉了。
+        """
+        self._add_label(label)
+        self._bump(+1)
+
+    def end(self, label: str = "") -> None:
+        """与 begin 配对。多余调用不会把计数减成负数。"""
+        self._remove_label(label)
+        self._bump(-1)
+
+    def current_label(self) -> str:
+        """当前正在进行的任务说明（可能为空）。
+
+        多个任务并行时取最后一个——它通常是用户刚点的那个，最贴近
+        用户此刻的意图。
+        """
+        with self._lock:
+            return self._labels[-1] if self._labels else ""
+
+    def _add_label(self, text: str) -> None:
+        with self._lock:
+            self._labels.append(text)
+
+    def _remove_label(self, text: str) -> None:
+        with self._lock:
+            # 从后往前找：同名任务并行时移除最后加入的那个
+            for i in range(len(self._labels) - 1, -1, -1):
+                if self._labels[i] == text:
+                    del self._labels[i]
+                    return
+
     # -- 提交任务 ------------------------------------------------------
 
     def submit(
@@ -89,9 +133,21 @@ class TaskRunner:
         *,
         on_done: Optional[Callable[[Any], None]] = None,
         on_error: Optional[Callable[[BaseException], None]] = None,
+        busy_text: Optional[str] = None,
     ) -> None:
-        """在后台线程执行 work，完成或出错时回到主线程回调。"""
+        """在后台线程执行 work，完成或出错时回到主线程回调。
+
+        busy_text 显示在状态栏的忙碌提示里，让用户知道在等什么。
+
+        **忙碌状态完全由 TaskRunner 管**：面板不要再自己调
+        status.busy()。两边都调会导致计数错配——busy 加两次而 idle
+        只减一次，进度条永远转下去。这个 bug 真实发生过：知识库导入
+        完成后状态栏一直显示「运行中（1 个后台任务）」，而任务其实
+        早就成功了（管理后台显示 0 个任务）。
+        """
         self._bump(+1)
+        label = busy_text or ""
+        self._add_label(label)
 
         def target() -> None:
             try:
@@ -103,6 +159,7 @@ class TaskRunner:
             else:
                 self._results.put(("ok", on_done, value))
             finally:
+                self._remove_label(label)
                 self._bump(-1)
 
         threading.Thread(target=target, daemon=True).start()

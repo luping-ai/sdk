@@ -191,7 +191,11 @@ class ChatPanel(ttk.Frame):
         self._fields.clear()
         self._btn_send.configure(state="disabled")
         self._btn_stop.configure(state="normal")
-        self._app.status.busy("生成中…")
+
+        # 流式不走 runner.submit（那会在忙碌期间禁用所有按钮，而这里
+        # 必须让「停止」可用）。用 runner.begin/end 手动配对，这样它
+        # 与其它后台任务共享同一套 pending 计数，不会互相覆盖忙碌提示。
+        self._app.runner.begin("生成中")
 
         threading.Thread(target=self._stream_worker,
                          args=(client, req), daemon=True).start()
@@ -261,7 +265,7 @@ class ChatPanel(ttk.Frame):
         self._running = False
         self._btn_send.configure(state="normal")
         self._btn_stop.configure(state="disabled")
-        self._app.status.idle()
+        self._app.runner.end("生成中")
 
         if kind == "ok":
             self._render_summary(payload)

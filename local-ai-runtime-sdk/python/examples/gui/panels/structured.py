@@ -199,11 +199,11 @@ class StructuredPanel(ttk.Frame):
             self._app.status.error("运行失败")
             self._app.notify_error(exc)
 
-        self._app.status.busy("生成中…")
-        self._app.runner.submit(work, on_done=done, on_error=error)
+        # 忙碌状态由 runner 统一管，这里只声明"在等什么"
+        self._app.runner.submit(work, on_done=done, on_error=error,
+                                busy_text="结构化生成中")
 
     def _render(self, res: object, mode: str) -> None:
-        self._app.status.idle()
         content = res.content                      # type: ignore[attr-defined]
         set_text(self._raw, content)
 

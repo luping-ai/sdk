@@ -64,6 +64,106 @@ jobs:
           cache-dependency-path: local-ai-runtime-sdk/go/go.mod
       - run: go build ./examples/...
 
+  # Python SDK：三平台 × 三个 Python 版本。
+  #
+  # discovery 文件路径三平台不同（Windows 用 LOCALAPPDATA、Linux 用
+  # XDG_DATA_HOME、macOS 用 ~/.local-ai-hub），而 CI 的 Linux 只覆盖
+  # 其中一条分支——所以必须都跑。
+  #
+  # 3.9 是声明的最低版本：代码里用 Optional[X] 而不是 X | None，
+  # 就是为了在 3.9 上 typing.get_type_hints() 不会炸。
+  python:
+    name: Python (local-ai-runtime-sdk/python)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: local-ai-runtime-sdk/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 运行时依赖为空，所以只装开发工具。
+      - name: 安装开发依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" ruff
+
+      - name: ruff
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: ruff check localai tests
+
+      - name: mypy
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: mypy localai
+
+      # 关键：不设 LAIH_E2E，test_live.py 应全部跳过而不是失败。
+      - name: pytest
+        run: pytest -v
+
+      # 零依赖是设计约束，必须在 CI 里守住：一旦有人加了一条
+      # dependencies，这里会立刻失败。
+      - name: 校验零运行时依赖
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          count=$(python -c "
+          import tomllib
+          with open('pyproject.toml','rb') as f:
+              d = tomllib.load(f)
+          print(len(d['project'].get('dependencies', [])))
+          " 2>/dev/null || python -c "
+          import tomli as tomllib
+          with open('pyproject.toml','rb') as f:
+              d = tomllib.load(f)
+          print(len(d['project'].get('dependencies', [])))
+          ")
+          if [ \"$count\" != \"0\" ]; then
+            echo \"::error::pyproject.toml 的 dependencies 应为空（零依赖是设计约束）\"
+            exit 1
+          fi
+          echo \"✓ 零运行时依赖\"
+
+  # 打包检查：构建不出来等于发不了版。
+  python-package:
+    name: Python wheel build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: local-ai-runtime-sdk/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --wheel --outdir dist
+      - name: 校验包内含 py.typed 与 LICENSE
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"应恰好产出一个 wheel，实际 {wheels}")
+          with zipfile.ZipFile(wheels[0]) as z:
+              names = z.namelist()
+          need = ["localai/py.typed"]
+          missing = [n for n in need if n not in names]
+          if missing:
+              sys.exit(f"wheel 缺少 {missing}")
+          if not any("licenses/LICENSE" in n for n in names):
+              sys.exit("wheel 缺少 LICENSE")
+          print("✓ wheel 结构正确:", wheels[0])
+          PY
+
   # 子目录模块的 tag 必须带目录前缀（local-ai-runtime-sdk/go/v0.1.0）。
   #
   # 裸 tag（v0.1.0）不会让 go get 报"tag 写错了"，而是报一句极具误导性的

@@ -1,0 +1,90 @@
+[project]
+name = "luping-localai"
+version = "0.1.0"
+description = "Local AI Hub Runtime 的官方 Python 客户端（零依赖）"
+readme = "README.md"
+requires-python = ">=3.9"
+# 用 SPDX 表达式而不是 license = { text = ... }：
+# 新版 packaging 会警告后者，且 SPDX 表达式能被子工具（依赖审计、
+# 镜像扫描）直接识别。
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "luping-ai" }]
+keywords = ["local-ai", "llm", "rag", "openai-compatible", "runtime"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Typing :: Typed",
+]
+
+# 零运行时依赖是刻意的设计约束，与 Go SDK 一致。
+# 只用标准库（urllib / json / threading），因此不会给引入方带来任何
+# 传递依赖。加任何一条 dependencies 之前，先读 README 的"零依赖"一节。
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/luping-ai/sdk"
+Source = "https://github.com/luping-ai/sdk"
+Documentation = "https://github.com/luping-ai/sdk/blob/main/local-ai-runtime-sdk/python/README.md"
+
+[project.optional-dependencies]
+# 仅开发期需要。运行时不装任何东西。
+dev = ["pytest>=7", "mypy>=1.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["localai"]
+
+[tool.setuptools.package-data]
+localai = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# 与 requires-python 保持一致。**不要升到 py310**：
+# 代码里用 `Optional[X]` 而不是 `X | None` 正是为了能在 3.9 上跑
+# （虽然 `from __future__ import annotations` 让 `X | None` 在注解
+# 位置也能用，但 `typing.get_type_hints()` 一求值就会 TypeError）。
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes：未使用导入、未定义名字
+    "E",    # pycodestyle 错误
+    "W",    # pycodestyle 警告
+    "I",    # isort：导入顺序
+    "B",    # bugbear：可疑写法
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "RUF",  # ruff 自有规则
+]
+ignore = [
+    # Optional[X] 与 py39 的取舍见 target-version 的注释
+    "UP045",
+    # 允许 `except Exception`：ClosingIterator.__del__ 必须吞掉一切，
+    # 解释器退出时抛异常只会印一行无用的 "Exception ignored"
+    "BLE001",
+    "S110",
+    # 测试里 assert 盲异常是有意的（我们要断言"抛了 APIError"，而不是
+    # 断言某个内部类型）
+    "B017",
+    # 中文注释/文档/字符串里的全角标点（，：。"" ）不是"易混淆字符"。
+    # 这三条规则是为防止把西里尔字母 a 写成英文 a 这类同形字攻击，
+    # 与中文项目无关，开着只会产生上千条噪音。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]

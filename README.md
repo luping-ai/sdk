@@ -9,10 +9,15 @@ Apache License 2.0，见 [LICENSE](LICENSE)。
 ```
 local-ai-runtime-sdk/          Local AI Hub Runtime 的客户端
 ├── docs/openapi.yaml          接口契约（多语言共用，唯一真相）
-└── go/                        Go 客户端
-    ├── go.mod                 独立 Go 模块
-    ├── localai/               源码
-    └── examples/sdkdemo/      可运行示例
+├── go/                        Go 客户端
+│   ├── go.mod                 独立 Go 模块
+│   ├── localai/               源码
+│   └── examples/sdkdemo/      可运行示例
+└── python/                    Python 客户端
+    ├── pyproject.toml         独立包（零运行时依赖）
+    ├── localai/               源码（导入名仍是 localai）
+    ├── tests/                 单元测试 + 真实实例端到端测试
+    └── examples/demo.py       可运行示例，兼作冒烟测试
 
 # 未来的产品按同样形状加在这里：
 # other-product-sdk/
@@ -30,10 +35,16 @@ local-ai-runtime-sdk/          Local AI Hub Runtime 的客户端
 | 产品 | 语言 | 模块 / 包名 | 安装 |
 | --- | --- | --- | --- |
 | Local AI Hub Runtime | Go | `github.com/luping-ai/sdk/local-ai-runtime-sdk/go` | `go get github.com/luping-ai/sdk/local-ai-runtime-sdk/go` |
+| Local AI Hub Runtime | Python | `luping-localai`（导入名 `localai`） | `pip install luping-localai` |
 
 接入说明见各语言目录下的 README：
 
 - [Local AI Hub Go SDK](local-ai-runtime-sdk/go/README.md)
+- [Local AI Hub Python SDK](local-ai-runtime-sdk/python/README.md)
+
+> **Python 的包名为什么不是 `localai`**：`localai` 与 `local-ai-runtime`
+> 在 PyPI 上都已被他人占用（前者是一个 AutoGPT 项目，后者是另一个
+> 同名 runtime）。发行名用 `luping-localai`，**导入名仍是 `localai`**。
 
 ## 发布：Go 模块的 tag 规则（重要）
 
@@ -75,6 +86,29 @@ other-product-sdk/go/v1.0.0
 其它语言不受这条规则约束：Python 发到 PyPI、npm 发到 registry 之后，
 仓库布局对使用者完全不可见，tag 只用于标记发布点。
 
+### Python 发版（不走 tag 规则）
+
+```bash
+cd local-ai-runtime-sdk/python
+
+# 1. 改 pyproject.toml 的 version，并把 README 的"已知限制"核对一遍
+# 2. 本地验证
+pytest && ruff check localai tests && mypy localai
+python -m build --wheel --outdir dist
+
+# 3. 发布（需要 PyPI 凭证）
+twine upload dist/*
+```
+
+打一个纯标记 tag（格式任意，CI 的 `tag-format` 只拦裸 `v*`）：
+
+```bash
+git tag python/v0.1.0
+```
+
+> **不要**打 `v0.1.0` 这种裸 tag——CI 会拦（它意味着"仓库根是 Go 模块"，
+> 而本仓库根没有 `go.mod`）。
+
 ## 本地开发
 
 各语言目录是**自包含**的，进去就能跑：
@@ -82,6 +116,14 @@ other-product-sdk/go/v1.0.0
 ```bash
 cd local-ai-runtime-sdk/go
 go test ./...
+```
+
+```bash
+cd local-ai-runtime-sdk/python
+python -m venv .venv && .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest                                          # 不需要 Runtime（默认跳过端到端）
+ruff check localai tests && mypy localai
 ```
 
 不需要在仓库根做任何 bootstrap——没有工作区文件、没有根级 go.mod。

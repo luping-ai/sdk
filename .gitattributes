@@ -1,0 +1,20 @@
+# 统一换行符：源码一律 LF 入库。
+#
+# 仓库在 Windows 上开发，默认 autocrlf 会把 .go / .yml 存成 CRLF。
+# 后果：CI 的 gofmt 检查在 Linux 上会因行尾差异失败，且下游 diff 里
+# 混满"整文件改动"。这里显式钉死，和平台无关。
+* text=auto eol=lf
+
+*.go     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+
+# 二进制
+*.exe    binary
+*.png    binary
+*.jpg    binary
+*.gif    binary

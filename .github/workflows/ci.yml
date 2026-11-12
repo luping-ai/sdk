@@ -134,6 +134,50 @@ jobs:
       - name: 示例可运行（--list）
         run: python examples/demo.py --list
 
+      # GUI 在 CI 里无法开窗口（没有显示服务）。只验证：
+      #   · 所有模块能被导入与解析（语法/导入错误在这里就会暴露）
+      #   · tkinter 可用性检查能正常走通
+      - name: GUI 模块可导入
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        shell: bash
+        run: |
+          set -e
+          cd examples/gui
+          python - <<'PY'
+          import ast, pathlib, sys
+          ok = 0
+          for p in sorted(pathlib.Path('.').rglob('*.py')):
+              ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
+              ok += 1
+          print(f"✓ {ok} 个 GUI 源文件语法正确")
+          PY
+
+      # 没有显示服务时 app.py 必须给出可读提示并以非零退出，
+      # 而不是抛一坨 TclError traceback。
+      - name: GUI 无显示服务时优雅失败
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set +e
+          unset DISPLAY
+          cd examples/gui
+          python app.py > gui.txt 2>&1
+          code=$?
+          cat gui.txt
+          if [ "$code" -eq 0 ]; then
+            echo "::error::无显示服务时 app.py 应非零退出"
+            exit 1
+          fi
+          if grep -q "Traceback" gui.txt; then
+            echo "::error::app.py 抛了 traceback，应给出可读提示"
+            exit 1
+          fi
+          if ! grep -q "demo.py" gui.txt; then
+            echo "::error::提示里应指引用户改用命令行版 demo.py"
+            exit 1
+          fi
+          echo "✓ 无显示服务时给出可读提示"
+
       # 无 Runtime 时示例必须给出可操作的提示并以非零退出，
       # 而不是抛 traceback 让用户不知所措。
       - name: 示例在无 Runtime 时优雅失败

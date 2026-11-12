@@ -111,6 +111,25 @@ python examples/demo.py --list    # 只列编号，不连 Runtime
 > 每项独立：某一项因本机能力不足（如没启用 RAG）会跳过并说明原因，
 > 不影响其他项。
 
+### 图形界面版
+
+想要可视化体验，用 `examples/gui/`：
+
+```bash
+python examples/gui/app.py
+```
+
+一个窗口五个面板：连接与健康、能力与模型、对话（流式逐字显示）、
+结构化输出、知识库全流程。同样**零依赖**——用的是标准库自带的
+tkinter，不需要装 PyQt 之类。
+
+其中「结构化输出」面板可以在「有上限 / 无上限」两种 schema 间切换
+对比：后者会卡二十几秒然后产出非法 JSON，是约束解码边界的直观演示。
+
+详见 [examples/gui/README.md](examples/gui/README.md)。
+
+> 无图形环境（SSH、容器、CI）跑不了 GUI，用命令行版即可。
+
 ---
 
 ## 一、它不做什么

@@ -78,6 +78,7 @@ paths:
     get:
       tags: [internal]
       summary: 服务自述与端点清单
+      operationId: getSelfDescription
       description: |
         便于人工 curl 检查服务是否在跑。
 
@@ -110,6 +111,7 @@ paths:
     get:
       tags: [health]
       summary: 就绪状态（/health/ready 的别名）
+      operationId: getHealth
       responses:
         "200":
           $ref: "#/components/responses/HealthReport"
@@ -123,6 +125,7 @@ paths:
     get:
       tags: [health]
       summary: 进程存活
+      operationId: getHealthLive
       description: |
         只要 HTTP 服务能响应就返回 200，**不检查模型或资源**。
 
@@ -147,6 +150,7 @@ paths:
     get:
       tags: [health]
       summary: 能否接受推理请求
+      operationId: getHealthReady
       description: |
         `ready` 与 `degraded` 都返回 200——degraded 意味着能力受限
         （如只能走规则引擎），但服务仍在。
@@ -165,6 +169,7 @@ paths:
     get:
       tags: [health]
       summary: 初始化是否完成
+      operationId: getHealthStartup
       description: |
         与 ready 的区别：startup 一旦成功就不会再变回 false，
         而 ready 可能因资源告急而变化。
@@ -183,6 +188,7 @@ paths:
     get:
       tags: [models]
       summary: 列出所有已注册的模型
+      operationId: listModels
       description: |
         纯查询接口，不触发加载或资源分配。
 
@@ -203,6 +209,7 @@ paths:
     get:
       tags: [models]
       summary: 当前加载的模型详情
+      operationId: getActiveModel
       description: |
         **无模型时返回 503**（错误码 `model_unavailable`）。
 
@@ -229,6 +236,7 @@ paths:
     post:
       tags: [models]
       summary: 加载模型
+      operationId: loadModel
       description: |
         **耗时操作**（可能数十秒）。同步语义（文档 19.9）。
 
@@ -268,12 +276,9 @@ paths:
                   - $ref: "#/components/schemas/Envelope"
                   - type: object
                     properties:
-                      data:
-                        type: object
-                        properties:
-                          model_id: { type: string }
+                      data: { $ref: "#/components/schemas/LoadModelResponse" }
         "202":
-          description: 已接受，后台加载中（`async: true`）
+          description: "已接受，后台加载中（`async: true`）"
           content:
             application/json:
               schema:
@@ -282,7 +287,6 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: "#/components/schemas/SubmittedTask" }
-                          already_loaded: { type: boolean }
         "404":
           description: 模型未安装
           content:
@@ -298,6 +302,7 @@ paths:
     post:
       tags: [models]
       summary: 下载模型文件（强制异步）
+      operationId: downloadModel
       description: |
         ## 为什么强制异步，不提供同步模式
 
@@ -363,7 +368,8 @@ paths:
     post:
       tags: [models]
       summary: 卸载当前模型
-      description: 幂等：本来就没有模型时返回 `unloaded: false` 但不报错。
+      operationId: unloadModel
+      description: "幂等：本来就没有模型时返回 `unloaded: false` 但不报错。"
       responses:
         "200":
           description: 卸载结果
@@ -383,6 +389,7 @@ paths:
     post:
       tags: [chat]
       summary: 对话（支持流式与知识库增强）
+      operationId: chat
       description: |
         ## 流式
 
@@ -454,6 +461,7 @@ paths:
     get:
       tags: [knowledge]
       summary: 列出知识库
+      operationId: listKnowledgeBases
       responses:
         "200":
           description: 知识库列表
@@ -468,6 +476,7 @@ paths:
     post:
       tags: [knowledge]
       summary: 创建知识库
+      operationId: createKnowledgeBase
       requestBody:
         required: true
         content:
@@ -491,6 +500,7 @@ paths:
     delete:
       tags: [knowledge]
       summary: 删除知识库及其全部数据
+      operationId: deleteKnowledgeBase
       description: |
         级联清理文档、切片、向量、全文索引。这是不可恢复操作。
       parameters:
@@ -513,6 +523,7 @@ paths:
     get:
       tags: [knowledge]
       summary: 知识库统计与向量化进度
+      operationId: getKnowledgeBaseStats
       parameters:
         - $ref: "#/components/parameters/KBID"
       responses:
@@ -531,6 +542,7 @@ paths:
     post:
       tags: [knowledge]
       summary: 触发向量化
+      operationId: vectorizeKnowledgeBase
       description: |
         为尚无向量的切片生成向量。
 
@@ -572,6 +584,7 @@ paths:
     get:
       tags: [knowledge]
       summary: 列出知识库中的文档
+      operationId: listDocuments
       parameters:
         - $ref: "#/components/parameters/KBID"
       responses:
@@ -588,6 +601,7 @@ paths:
     post:
       tags: [knowledge]
       summary: 导入文档（或更新已有文档）
+      operationId: importDocument
       description: |
         ## 支持的格式
 
@@ -634,6 +648,7 @@ paths:
     post:
       tags: [knowledge]
       summary: 上传文档并导入
+      operationId: uploadDocument
       description: |
         ## 与路径导入的区别
 
@@ -704,6 +719,7 @@ paths:
     delete:
       tags: [knowledge]
       summary: 删除文档
+      operationId: deleteDocument
       description: |
         级联清理切片、向量、全文索引。
 
@@ -740,6 +756,7 @@ paths:
     post:
       tags: [knowledge]
       summary: 知识库检索（关键词 + 语义 + RRF 混合）
+      operationId: searchKnowledge
       description: |
         ## 知识库隔离
 
@@ -784,6 +801,7 @@ paths:
     post:
       tags: [chat]
       summary: L0 规则引擎（不依赖模型）
+      operationId: analyzeWithRules
       description: |
         用途：
         - 业务方明确知道"我只要关键词匹配"时直接调用
@@ -818,6 +836,7 @@ paths:
     get:
       tags: [observe]
       summary: 聚合指标（JSON）
+      operationId: getStats
       description: |
         同时返回两类数据：
 
@@ -844,6 +863,7 @@ paths:
     get:
       tags: [observe]
       summary: Prometheus 文本格式指标
+      operationId: getMetrics
       description: |
         与 `/api/v1/stats` 同源，只是序列化方式不同。
 
@@ -867,6 +887,7 @@ paths:
     get:
       tags: [observe]
       summary: 调度器统计
+      operationId: getSchedulerStats
       description: 判断"系统是否过载"的直接依据。
       responses:
         "200":
@@ -884,6 +905,7 @@ paths:
     get:
       tags: [observe]
       summary: 资源占用分析
+      operationId: getResources
       description: |
         不只是返回"资源不足"，而是告诉用户"被谁占了、能做什么"。
 
@@ -907,6 +929,7 @@ paths:
     get:
       tags: [observe]
       summary: 这台机器能做什么（对话 / RAG / 仅规则引擎）
+      operationId: getCapability
       description: |
         ## 与 `/health/ready` 和 `/api/v1/resources` 的分工
 
@@ -969,6 +992,7 @@ paths:
     get:
       tags: [tasks]
       summary: 列出所有异步任务
+      operationId: listTasks
       description: |
         按创建时间降序返回。任务数有上限（默认 200），全量返回便于排查
         "为什么我的任务不见了"。
@@ -997,6 +1021,7 @@ paths:
     get:
       tags: [tasks]
       summary: 查询任务状态
+      operationId: getTask
       description: |
         ## 客户端应轮询这个端点
 
@@ -1042,6 +1067,7 @@ paths:
     post:
       tags: [tasks]
       summary: 取消任务
+      operationId: cancelTask
       description: |
         ## 取消会穿透到执行函数
 
@@ -1082,6 +1108,7 @@ paths:
     get:
       tags: [admin]
       summary: 可选模型列表（含 RAG 实测结论）
+      operationId: listAdminModelOptions
       description: |
         供管理界面做"只允许加载哪些模型"的白名单选择。
 
@@ -1134,6 +1161,7 @@ paths:
     get:
       tags: [admin]
       summary: 管理接口能力探测
+      operationId: getAdminStatus
       description: |
         ## 这个端点为什么必须存在
 
@@ -1177,7 +1205,9 @@ paths:
 
   /api/v1/admin/config:
     get:
-      tags: [admin]      summary: 读取运行时配置（可改 + 只读）
+      tags: [admin]
+      summary: 读取运行时配置（可改 + 只读）
+      operationId: getAdminConfig
       description: |
         ## persisted 是关键字段
 
@@ -1214,6 +1244,7 @@ paths:
     put:
       tags: [admin]
       summary: 修改运行时配置
+      operationId: updateAdminConfig
       description: |
         ## 必须提交完整配置
 
@@ -1275,6 +1306,7 @@ paths:
     get:
       tags: [admin]
       summary: 按 client_id 的调用统计
+      operationId: listAdminClients
       description: |
         用于回答"哪些应用在调用、谁在报错、平均多慢"。
 
@@ -1299,6 +1331,7 @@ paths:
     get:
       tags: [admin]
       summary: 日志尾部（已脱敏）
+      operationId: getAdminLogs
       description: |
         ## 必须脱敏
 
@@ -1340,6 +1373,7 @@ paths:
     get:
       tags: [admin]
       summary: 系统概览（聚合）
+      operationId: getAdminSystem
       description: |
         ## 为什么聚合
 
@@ -1370,6 +1404,7 @@ paths:
     get:
       tags: [admin]
       summary: 下载诊断包（zip）
+      operationId: downloadAdminDiagnostics
       description: |
         返回 `application/zip` 附件，**不经过 Envelope 包装**——
         二进制流无法包 JSON。
@@ -1405,6 +1440,7 @@ paths:
     post:
       tags: [admin]
       summary: 重置 API token（危险操作）
+      operationId: rotateAdminToken
       description: |
         ## 后果
 
@@ -1440,6 +1476,7 @@ paths:
     post:
       tags: [openai]
       summary: OpenAI Chat Completions 兼容
+      operationId: openaiChatCompletions
       description: |
         ## 为什么单独实现序列化
 
@@ -1535,6 +1572,7 @@ paths:
     get:
       tags: [openai]
       summary: OpenAI 模型列表
+      operationId: openaiListModels
       description: |
         返回 `{"object":"list","data":[...]}` 格式，兼容 OpenAI SDK。
 
@@ -1568,6 +1606,7 @@ paths:
     post:
       tags: [openai]
       summary: OpenAI Embeddings（文本向量化）
+      operationId: openaiEmbeddings
       description: |
         OpenAI 兼容的向量化端点。底层是 `llama-server --embeddings`
         （`multilingual-e5-small`），由 `-embedding-model` 参数启用。
@@ -1818,15 +1857,16 @@ components:
             - model_unavailable
             - capability_unmet
             - internal_error
-          description: 稳定的错误标识，SDK 依赖它做分支判断，**不可变更**
+          description: |
+            稳定的错误标识，SDK 依赖它做分支判断，**不可变更**
 
-          `model_not_found` 与 `not_found` 刻意分开：前者要换模型或下载，
-          后者要检查 ID（知识库/文档/文件）。共用一个码会让调用方朝
-          错误方向排查。
+            `model_not_found` 与 `not_found` 刻意分开：前者要换模型或下载，
+            后者要检查 ID（知识库/文档/文件）。共用一个码会让调用方朝
+            错误方向排查。
 
-          `capability_unmet` 与 `resource_limited` 也刻意分开：后者是
-          "关掉其他程序再试"，前者是"关程序没用，得换模型或改配置"
-          （模型被白名单/能力要求挡住）。共用会让用户白折腾。
+            `capability_unmet` 与 `resource_limited` 也刻意分开：后者是
+            "关掉其他程序再试"，前者是"关程序没用，得换模型或改配置"
+            （模型被白名单/能力要求挡住）。共用会让用户白折腾。
         message: { type: string }
         retryable: { type: boolean }
         retry_after_ms: { type: integer, format: int64 }
@@ -1971,6 +2011,28 @@ components:
             判定容忍 size 字段的小偏差（<1% 或 <1 MiB）——
             实测发现清单里的 size 可能与真实文件差几百字节，
             严格比较会让可用模型显示为"未下载"。
+
+    LoadModelResponse:
+      type: object
+      description: |-
+        同步加载（`async` 缺省或 false）的 200 响应。
+
+        异步模式返回的是 `SubmittedTask`（含 `task_id`），不是这个结构。
+        `already_loaded` 目前恒为 false——服务端尚未实现"已加载则跳过"的
+        短路判断，保留字段是为了将来加上时不破坏契约。
+      required: [model_id]
+      properties:
+        model_id:
+          type: string
+          description: 实际加载（或已在内存中）的模型 ID
+        already_loaded:
+          type: boolean
+          description: |-
+            该模型原本就已加载，本次未重新加载。
+
+            **当前实现恒为 false**：服务端还没有"目标模型已是当前模型
+            就直接返回"的短路分支。不要用它判断"是否真的重新加载了"。
+            （这个字段此前被错挂在 202 异步分支下，202 根本没有它。）
 
     ModelList:
       type: object
@@ -2951,7 +3013,8 @@ components:
         不影响正在执行的任务。
 
         每项都有明确范围；非法值返回 400 且不污染当前配置。
-      required: [log_level, max_concurrent, max_queue, reserved_interactive, client_max_queued, client_max_concurrent]      properties:
+      required: [log_level, max_concurrent, max_queue, reserved_interactive, client_max_queued, client_max_concurrent]
+      properties:
         log_level:
           type: string
           enum: [debug, info, warn, error]

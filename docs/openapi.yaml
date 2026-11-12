@@ -1,0 +1,3294 @@
+openapi: 3.1.0
+
+# Local AI Hub Runtime API
+#
+# ## 这份文件的地位
+#
+# 文档 24.3 规定：**本文件是接口契约的唯一真相**。
+# Go SDK 是手写薄封装，其他语言 SDK 由生成器从本文件产出。
+# 禁止各语言各自维护类型定义——那必然漂移。
+#
+# ## 与实现的同步要求
+#
+# 本文件必须与 internal/api/ 下的实际实现一致。修改接口时：
+#   1. 先改本文件（契约先行）
+#   2. 再改实现
+#   3. 最后改 SDK
+
+info:
+  title: Local AI Hub Runtime API
+  version: 0.1.0-dev
+  description: |
+    本地 AI Runtime 的 HTTP 接口。
+
+    ## 两套并存的 API
+
+    | 前缀 | 用途 | 响应格式 |
+    | --- | --- | --- |
+    | `/api/v1/*` | 本项目的高层语义接口 | 统一 Envelope |
+    | `/v1/*` | OpenAI 兼容层 | 严格 OpenAI 格式 |
+
+    两者的响应结构**完全不同**，不可混用。OpenAI 官方 SDK 严格解析
+    响应结构，多一层 Envelope 包装会导致解析失败。
+
+    ## 认证
+
+    除特别说明外，所有端点要求 `Authorization: Bearer <token>`。
+    token 从 discovery 文件读取。
+
+    ## Host 校验
+
+    只接受 `Host` 为 `127.0.0.1` / `localhost` / `[::1]`（端口可选）。
+    这是防 DNS rebinding 的必要措施——仅监听 loopback 不够，
+    因为浏览器的恶意页面确实是在访问 127.0.0.1。
+  license:
+    name: 待定
+
+servers:
+  - url: http://127.0.0.1:{port}
+    description: |
+      端口是**动态分配**的（ADR 0004），不能写死。
+      SDK 应从 discovery 文件读取实际地址。
+    variables:
+      port:
+        default: "18765"
+        description: 优先尝试 18765，被占用则回退到随机端口
+
+tags:
+  - name: health
+    description: 健康检查（三态分离，见文档 26.2）
+  - name: models
+    description: 模型查询与管理
+  - name: chat
+    description: 对话与推理
+  - name: knowledge
+    description: 知识库管理与检索
+  - name: observe
+    description: 可观测性（指标、调度、资源）
+  - name: openai
+    description: OpenAI 兼容层
+  - name: internal
+    description: 内部/诊断端点
+
+security:
+  - bearerAuth: []
+
+paths:
+  /:
+    get:
+      tags: [internal]
+      summary: 服务自述与端点清单
+      description: |
+        便于人工 curl 检查服务是否在跑。
+
+        **SDK 不应依赖此端点**：它的路径可能变化，
+        且 discovery 文件已提供连接所需的全部信息。
+      security: []
+      responses:
+        "200":
+          description: 服务信息
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  request_id: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      service: { type: string, example: LocalAIHub }
+                      version: { type: string, example: 0.1.0-dev }
+                      api: { type: string, example: v1 }
+                      endpoints:
+                        type: array
+                        items: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /health:
+    get:
+      tags: [health]
+      summary: 就绪状态（/health/ready 的别名）
+      responses:
+        "200":
+          $ref: "#/components/responses/HealthReport"
+        "503":
+          description: 未就绪（模型未加载或资源告急）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /health/live:
+    get:
+      tags: [health]
+      summary: 进程存活
+      description: |
+        只要 HTTP 服务能响应就返回 200，**不检查模型或资源**。
+
+        用途：进程守护工具判断是否需要重启 Runtime。
+        与 ready 的区别：进程活着不代表能推理。
+      responses:
+        "200":
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: alive }
+                      uptime_seconds: { type: integer, format: int64 }
+
+  /health/ready:
+    get:
+      tags: [health]
+      summary: 能否接受推理请求
+      description: |
+        `ready` 与 `degraded` 都返回 200——degraded 意味着能力受限
+        （如只能走规则引擎），但服务仍在。
+
+        业务方应读响应体里的 `data.state` 自行决定是否接受降级结果。
+      responses:
+        "200":
+          $ref: "#/components/responses/HealthReport"
+        "503":
+          description: 不可服务（无模型且无法降级，或资源严重不足）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /health/startup:
+    get:
+      tags: [health]
+      summary: 初始化是否完成
+      description: |
+        与 ready 的区别：startup 一旦成功就不会再变回 false，
+        而 ready 可能因资源告急而变化。
+
+        启动编排应等 startup 通过，而不是轮询 ready。
+      responses:
+        "200":
+          $ref: "#/components/responses/HealthReport"
+        "503":
+          description: 仍在初始化
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/models:
+    get:
+      tags: [models]
+      summary: 列出所有已注册的模型
+      description: |
+        纯查询接口，不触发加载或资源分配。
+
+        业务方据此判断某个能力（如 `rag`、`extraction`）是否有模型支持。
+      responses:
+        "200":
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ModelList" }
+
+  /api/v1/models/active:
+    get:
+      tags: [models]
+      summary: 当前加载的模型详情
+      description: |
+        **无模型时返回 503**（错误码 `model_unavailable`）。
+
+        SDK 建议改用 `/api/v1/models` 的 `active` 字段——
+        "没有模型"是正常初始状态，不该被当成错误。
+      responses:
+        "200":
+          description: 当前模型
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ModelSummary" }
+        "503":
+          description: 当前没有加载任何模型
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/models/load:
+    post:
+      tags: [models]
+      summary: 加载模型
+      description: |
+        **耗时操作**（可能数十秒）。同步语义（文档 19.9）。
+
+        若已有其他模型加载，会先卸载再加载新的——避免两个引擎进程
+        同时存在造成瞬时内存峰值。
+
+        加载前做资源准入检查（RSS 外推，见 ADR 0005），
+        内存不足时返回 `resource_limited` 而不是等到 OOM。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id]
+              properties:
+                model_id:
+                  type: string
+                  example: granite-4.0-h-350m-q4
+                async:
+                  type: boolean
+                  default: false
+                  description: |
+                    为 true 时立即返回 202 + `task_id`，在后台加载。
+
+                    **建议大模型一律用异步**：同步请求会一直等到引擎就绪，
+                    大模型可能数十秒（超时上限 5 分钟），浏览器默认会先断开。
+                    异步模式下客户端轮询 `/api/v1/tasks/{id}`，不占连接，
+                    且可以取消。
+      responses:
+        "200":
+          description: 加载成功（同步模式）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          model_id: { type: string }
+        "202":
+          description: 已接受，后台加载中（`async: true`）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/SubmittedTask" }
+                          already_loaded: { type: boolean }
+        "404":
+          description: 模型未安装
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+        "503":
+          description: 资源不足或正在加载其他模型
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/models/download:
+    post:
+      tags: [models]
+      summary: 下载模型文件（强制异步）
+      description: |
+        ## 为什么强制异步，不提供同步模式
+
+        模型动辄 1~2 GB。同步下载会占住一条 HTTP 连接几分钟，
+        浏览器/代理必然超时——而用户完全不知道"下载到哪了"。
+
+        因此即使调用方没传 `async`，也**总是**返回 202 + `task_id`。
+        这不是忽略调用方意图，而是这个操作客观上不可能是同步的。
+
+        ## 安全约束
+
+        | 约束 | 原因 |
+        | --- | --- |
+        | 清单必须提供 `sha256` | 未校验的文件进入模型目录就是安全隐患 |
+        | 断点续传用 `.part` 后缀 | 未完成的文件不能被当成完整文件 |
+        | 校验失败必删文件 | 否则下次会跳过下载，用着一个坏文件 |
+        | 同样受模型策略约束 | 设了"只允许 RAG 模型"时不该能下不达标的模型 |
+
+        ## 进度
+
+        任务进度按**全部文件总字节**折算，不是单文件百分比——
+        否则用户看到第一个文件到 100% 会以为整体完成了。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id]
+              properties:
+                model_id:
+                  type: string
+                  example: qwen2.5-1.5b-instruct-q4
+                mirror:
+                  type: string
+                  description: |
+                    镜像前缀，如 `https://hf-mirror.com`。
+                    留空则用服务端的 `-download-mirror` 或直连。
+      responses:
+        "202":
+          description: 已接受，后台下载中
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/SubmittedTask" }
+        "400":
+          description: |
+            参数错误：清单缺文件条目、缺 sha256（拒绝下载未校验文件）。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+        "409":
+          description: 模型不符合当前策略（白名单/能力要求）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/models/unload:
+    post:
+      tags: [models]
+      summary: 卸载当前模型
+      description: 幂等：本来就没有模型时返回 `unloaded: false` 但不报错。
+      responses:
+        "200":
+          description: 卸载结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          unloaded: { type: boolean }
+
+  /api/v1/chat:
+    post:
+      tags: [chat]
+      summary: 对话（支持流式与知识库增强）
+      description: |
+        ## 流式
+
+        `stream: true` 时返回 SSE，事件顺序：
+        `queued`（可能多次）→ `meta` → `warning`（可选）→ `delta`（多次）
+        → `usage` → `done`。
+
+        **队列满在发出 SSE 头之前判断**——一旦发出头，状态码就固化为
+        200，无法再返回 429。这是实现中必须遵守的约束。
+
+        ## 知识库（RAG）
+
+        传 `kb_ids` 即自动完成"检索 → 拼接 → 注入"，调用方不必先调
+        `/search` 再自己拼 prompt。注入的上下文含防注入标记与预算裁剪。
+
+        ## 降级
+
+        降级结果照常返回 200，通过 `model.degraded` 标记。
+        **降级不是错误**——业务方据此决定是否提示用户。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+      responses:
+        "200":
+          description: |
+            非流式返回 JSON Envelope；`stream: true` 时返回
+            `text/event-stream`。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ChatResponse" }
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/StreamEvent"
+              description: |
+                SSE 帧。每帧是一个 JSON 对象 `{"event": "...", "data": {...}}`，
+                最后一帧为 `data: [DONE]`。
+
+                事件顺序（`queued` 与 `warning` 可能不出现）：
+
+                | 顺序 | 事件 | 说明 |
+                | --- | --- | --- |
+                | 1 | `queued` | 排队位置，位置变化时重新推送 |
+                | 2 | `meta` | 模型、request_id、知识库信息 |
+                | 3 | `warning` | 检索告警（仅知识库有提示时） |
+                | 4 | `delta` | 增量文本，多次 |
+                | 5 | `usage` | token 统计与延迟 |
+                | 6 | `done` | 结束原因 |
+
+                任一步失败可能替换为 `error`。
+
+                **心跳**是以 `:` 开头的注释行，不是事件，客户端应跳过。
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/knowledge/bases:
+    get:
+      tags: [knowledge]
+      summary: 列出知识库
+      responses:
+        "200":
+          description: 知识库列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/KBList" }
+    post:
+      tags: [knowledge]
+      summary: 创建知识库
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateKBRequest" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/KnowledgeBaseRef" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+
+  /api/v1/knowledge/bases/{id}:
+    delete:
+      tags: [knowledge]
+      summary: 删除知识库及其全部数据
+      description: |
+        级联清理文档、切片、向量、全文索引。这是不可恢复操作。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DeletedResource" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/knowledge/bases/{id}/stats:
+    get:
+      tags: [knowledge]
+      summary: 知识库统计与向量化进度
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      responses:
+        "200":
+          description: 统计
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/KBStats" }
+
+  /api/v1/knowledge/bases/{id}/vectorize:
+    post:
+      tags: [knowledge]
+      summary: 触发向量化
+      description: |
+        为尚无向量的切片生成向量。
+
+        文档导入时切片已入库，因此**关键词检索立即可用**；
+        本端点补齐语义检索所需的向量。
+
+        `async: true` 时立即返回，后台执行。小知识库同步即可
+        （几百毫秒）；大知识库应异步，否则请求会持续数分钟。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                async:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: 向量化结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/VectorizeResult" }
+        "503":
+          description: 未配置 Embedding 模型（只能做关键词检索）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/knowledge/bases/{id}/documents:
+    get:
+      tags: [knowledge]
+      summary: 列出知识库中的文档
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      responses:
+        "200":
+          description: 文档列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DocumentList" }
+    post:
+      tags: [knowledge]
+      summary: 导入文档（或更新已有文档）
+      description: |
+        ## 支持的格式
+
+        `.txt` / `.md` / `.pdf` / `.docx` / `.xlsx`
+
+        不支持：`.doc` / `.xls` / `.pptx`（旧二进制或结构不同）。
+
+        ## 幂等
+
+        同一知识库内相同内容（SHA-256）只保留一份。
+        重复导入返回 `duplicate: true` 与已有文档 ID。
+
+        **失败的文档允许重试**：补上密码等修正后重新导入会真正重新解析，
+        而不是被去重逻辑挡住。
+
+        ## 增量更新
+
+        传 `update_document_id` 时更新已有文档而非新建。此时做 diff：
+        未变更的切片保留向量，只重新向量化新增与变更的片段。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportRequest" }
+      responses:
+        "200":
+          description: 导入结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ImportResult" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/knowledge/bases/{id}/documents/upload:
+    post:
+      tags: [knowledge]
+      summary: 上传文档并导入
+      description: |
+        ## 与路径导入的区别
+
+        `/documents`（JSON + `path`）适合 SDK 与 CLI：Runtime 直接读本机
+        文件，省内存也省带宽。
+
+        本端点用 `multipart/form-data` 接收文件内容，供**管理界面**使用——
+        界面里的用户不该被要求手敲一个绝对路径。两者共用同一条导入链路
+        （解析、切片、去重、增量 diff 的行为完全一致）。
+
+        ## 存储模式
+
+        恒为 `MANAGED`。上传内容先落到临时文件，导入完成后删除；知识库
+        另存一份托管副本用于重建索引。显式传 `EXTERNAL` 会被拒绝（那条
+        记录会指向一个已被删除的临时文件）。
+
+        ## 大小
+
+        请求体上限 110 MiB。单文件上限按格式：PDF 100 MB、
+        DOCX/XLSX 50 MB、纯文本 20 MB（与路径导入相同）。
+
+        ## 幂等
+
+        与路径导入一致：同知识库内内容相同（SHA-256）返回
+        `duplicate: true` 与已有文档 ID。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    文档内容。文件名（含扩展名）决定解析器选择，
+                    因此必须带上正确的扩展名。
+                name:
+                  type: string
+                  description: 显示名。省略则用上传的文件名。
+                password:
+                  type: string
+                  description: 加密 PDF 的密码，可省略（同路径导入）。
+                update_document_id:
+                  type: string
+                  description: 非空表示更新已有文档（增量 diff）。
+      responses:
+        "200":
+          description: 导入结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ImportResult" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/knowledge/bases/{id}/documents/{docId}:
+    delete:
+      tags: [knowledge]
+      summary: 删除文档
+      description: |
+        级联清理切片、向量、全文索引。
+
+        默认**同时删除托管副本**（"从知识库移除"的语义通常是连副本
+        一起清掉，否则磁盘会悄悄膨胀）。传 `keep_file=1` 保留。
+
+        外部引用模式绝不删除用户原文件——那可能毁掉用户唯一的资料。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+        - name: docId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: keep_file
+          in: query
+          required: false
+          schema: { type: string, enum: ["1"] }
+          description: 传 1 则保留托管文件
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DeletedDocument" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/search:
+    post:
+      tags: [knowledge]
+      summary: 知识库检索（关键词 + 语义 + RRF 混合）
+      description: |
+        ## 知识库隔离
+
+        `kb_ids` 必填且**不支持全库检索**（文档 22.9）。多库时分别
+        检索再合并——向量索引按库独立载入，无法跨库共享。
+
+        ## 两种通道
+
+        | 模式 | 说明 |
+        | --- | --- |
+        | `keyword` | bigram 全文索引（支持 2 字查询，trigram 不支持） |
+        | `semantic` | e5 向量 + 内存暴力检索 |
+        | `hybrid` | RRF 融合（默认） |
+
+        实测：查询"联系方式"时文档写的是"联系电话"，关键词 0 命中而
+        语义正确命中。两路都必需。
+
+        ## RAG 上下文
+
+        `build_context: true` 时额外返回拼好的上下文（含防注入标记、
+        预算裁剪、来源标注）。调用方直接取 `context.text` 作为消息内容。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: 检索结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+
+  /api/v1/rule/analyze:
+    post:
+      tags: [chat]
+      summary: L0 规则引擎（不依赖模型）
+      description: |
+        用途：
+        - 业务方明确知道"我只要关键词匹配"时直接调用
+        - 排查"模型不可用时到底能做什么"
+
+        结果必须标注 `method`（rule / keyword / none），
+        不能伪装成模型输出——用户有权知道这是关键词匹配。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  example: 联系人李娜，电话13812345678
+      responses:
+        "200":
+          description: 分析结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/RuleEngineResponse" }
+
+  /api/v1/stats:
+    get:
+      tags: [observe]
+      summary: 聚合指标（JSON）
+      description: |
+        同时返回两类数据：
+
+        - 累计指标（counter / histogram）：回答"发生过什么"
+        - `live` 实时状态：回答"此刻如何"
+
+        若两者不一致，说明埋点有遗漏——这本身就是有价值的信号。
+
+        采集前会主动刷新瞬时 gauge（如 `model_loaded`），
+        避免卸载后指标长期显示旧值。
+      responses:
+        "200":
+          description: 指标快照
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/StatsResponse" }
+
+  /metrics:
+    get:
+      tags: [observe]
+      summary: Prometheus 文本格式指标
+      description: |
+        与 `/api/v1/stats` 同源，只是序列化方式不同。
+
+        手写文本输出而非引入 Prometheus 客户端库：那个库会带来数十个
+        间接依赖并自动注册大量 `go_gc_*` 指标，与本项目"低占用"目标相悖。
+
+        Prometheus 抓取时需配置 `bearer_token`（本端点同样要求认证）。
+      responses:
+        "200":
+          description: Prometheus 文本
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP laih_http_requests_total HTTP 请求总数
+                # TYPE laih_http_requests_total counter
+                laih_http_requests_total{endpoint="/api/v1/chat",status="200"} 42
+
+  /api/v1/scheduler:
+    get:
+      tags: [observe]
+      summary: 调度器统计
+      description: 判断"系统是否过载"的直接依据。
+      responses:
+        "200":
+          description: 调度器状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/SchedulerStats" }
+
+  /api/v1/resources:
+    get:
+      tags: [observe]
+      summary: 资源占用分析
+      description: |
+        不只是返回"资源不足"，而是告诉用户"被谁占了、能做什么"。
+
+        用户看到这个响应后能决策：
+        - 降级使用小模型（继续用 AI，质量下降）
+        - 关闭某个程序（继续用大模型）
+        - 等待（如果只是暂时的）
+      responses:
+        "200":
+          description: 资源状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/ResourceStatus" }
+
+  /api/v1/capability:
+    get:
+      tags: [observe]
+      summary: 这台机器能做什么（对话 / RAG / 仅规则引擎）
+      description: |
+        ## 与 `/health/ready` 和 `/api/v1/resources` 的分工
+
+        | 端点 | 回答什么 |
+        | --- | --- |
+        | `/health/ready` | 服务是否活着 |
+        | `/api/v1/resources` | 现在资源有多紧张、被谁占了 |
+        | `/api/v1/capability` | **到底能做什么** |
+
+        客户端在**发请求之前**就该查这个：
+
+        - `rag_enabled: false` 时不要传 `kb_ids`——服务端会忽略它，
+          但用户会以为"检索过了，只是没找到"
+        - `chat_enabled: false` 时应当直接走本地规则，
+          而不是等一个必然失败的请求
+
+        ## 判据是实测，不是厂商声明
+
+        `rag_enabled` 只认模型清单里 `rag.qualified` 字段，
+        那是本项目对每个模型跑 RAG 用例集得出的**实测结论**。
+
+        实测发现厂商声明的 `recommended_for` 含 `rag` 不可靠：
+
+        | 模型 | 厂商声明 | 实测 |
+        | --- | --- | --- |
+        | Granite-4.0-H-350M | 含 rag | 4/8 |
+        | Granite-4.0-H-1B | 含 rag | 6/8 且会编造 |
+        | Qwen3-0.6B | **不含** rag | 16/16 |
+
+        按厂商声明判断会启用两个不达标的模型、漏掉唯一达标的小模型。
+
+        ## 能力等级
+
+        | level | rag_enabled | chat_enabled | 含义 |
+        | --- | --- | --- | --- |
+        | `full` | true | true | 可加载实测达标的模型，对话与 RAG 都可用 |
+        | `chat_only` | false | true | 能加载模型但没有实测达标的 RAG 模型 |
+        | `rule_only` | false | false | 连基准模型都装不下，只有规则引擎 |
+
+        基准模型是 **Qwen3-0.6B**（唯一在 1B 以下 RAG 全对的）。
+
+        ## 能力受限不是错误
+
+        总是返回 200。内存小是**环境事实**，不是服务故障——
+        返回 4xx/5xx 会让客户端当异常处理，而正确做法是据此
+        调整功能（禁用知识库开关、提示用户关闭其他程序）。
+      responses:
+        "200":
+          description: 能力状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Capability" }
+
+  /api/v1/tasks:
+    get:
+      tags: [tasks]
+      summary: 列出所有异步任务
+      description: |
+        按创建时间降序返回。任务数有上限（默认 200），全量返回便于排查
+        "为什么我的任务不见了"。
+
+        任务**只在内存中**：Runtime 重启后全部失效。这是刻意的——
+        模型也没了，持久化任务只会制造"任务还在但结果拿不到"的错觉。
+      responses:
+        "200":
+          description: 任务列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          tasks:
+                            type: array
+                            items: { $ref: "#/components/schemas/Task" }
+                          count: { type: integer }
+
+  /api/v1/tasks/{id}:
+    get:
+      tags: [tasks]
+      summary: 查询任务状态
+      description: |
+        ## 客户端应轮询这个端点
+
+        提交返回的 `poll_interval_ms` 是建议间隔（模型加载 1 秒、
+        向量化 2 秒）。间隔依据是任务的实际耗时特征——猜小了浪费请求，
+        猜大了用户看不到状态变化。
+
+        ## 状态流转
+
+        ```
+        queued → running → completed
+                         ↘ failed
+                         ↘ cancelled
+        ```
+
+        终态（completed / failed / cancelled）不会再变。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: 任务 ID（形如 `task_a1b2c3d4e5f6a7b8`）
+      responses:
+        "200":
+          description: 任务状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Task" }
+        "404":
+          description: |
+            任务不存在或已过期（默认保留 1 小时）。
+            code 是 `not_found` 而不是 `model_not_found`。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/tasks/{id}/cancel:
+    post:
+      tags: [tasks]
+      summary: 取消任务
+      description: |
+        ## 取消会穿透到执行函数
+
+        不只是把状态改成 cancelled——执行函数会收到 ctx 取消信号。
+        否则"取消后任务还在后台占 CPU"，用户的机器仍然被拖慢。
+
+        若执行函数不尊重 ctx（某些引擎调用无法中断），任务会跑完，
+        但结果被丢弃、状态保持 cancelled。这是刻意的：调用方说取消
+        就是取消。
+
+        ## 幂等
+
+        已结束的任务再取消返回当前状态而不是错误——用户点两次
+        "取消"不该看到失败。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 取消后的任务状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Task" }
+        "404":
+          description: 任务不存在或已过期
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+
+  /api/v1/admin/model-options:
+    get:
+      tags: [admin]
+      summary: 可选模型列表（含 RAG 实测结论）
+      description: |
+        供管理界面做"只允许加载哪些模型"的白名单选择。
+
+        ## 为什么单独一个端点
+
+        `/api/v1/models` 返回通用模型摘要（许可、量化等），但没突出
+        **RAG 实测是否达标**。而白名单选择的核心诉求正是
+        "我勾的模型能不能做 RAG"，因此这里把 `rag_qualified`
+        放在每项的顶层，界面可以直接用它做标签。
+
+        ## rag_qualified 的来源
+
+        只认清单里的 `rag.qualified`（本项目跑 RAG 用例集得出的实测
+        结论），**不看**厂商声明的 `capabilities`。
+
+        实测发现两者经常不一致：Granite 两代都标了 rag，
+        实测只有 6/13 与 7/13。
+      responses:
+        "200":
+          description: 模型候选列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          models:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id: { type: string }
+                                name: { type: string }
+                                capabilities:
+                                  type: array
+                                  items: { type: string }
+                                rag_qualified:
+                                  type: boolean
+                                  description: |-
+                                    RAG 实测是否达标（清单 `rag.qualified`）。
+                                    false 表示"未验证"或"实测不达标"。
+                                size_bytes: { type: integer, format: int64 }
+                                license: { type: string }
+
+  /api/v1/admin/status:
+    get:
+      tags: [admin]
+      summary: 管理接口能力探测
+      description: |
+        ## 这个端点为什么必须存在
+
+        管理接口默认**不注册**（需 `-enable-admin`）。管理后台要先知道
+        "这台 Runtime 有没有开管理面"才能决定显示哪些页面。
+
+        没有这个端点时只能靠"请求 admin/config 看是否 404"推断——
+        那等于嗅探错误文案，而文案会改、也会本地化；且 404 也可能
+        真的是路径写错，两者无法区分。
+
+        ## 两种状态都返回 200
+
+        未启用时是 `{"enabled": false, "hint": "..."}`，而不是 404。
+        这样前端只需判断 `enabled` 字段，不必按状态码分支。
+
+        未启用时**其他** `/api/v1/admin/*` 请求返回 404，message
+        是"管理接口未启用，启动时加 -enable-admin"——说清原因，
+        而不是让人以为路径写错。
+      responses:
+        "200":
+          description: 探测结果（无论启用与否都是 200）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [enabled]
+                        properties:
+                          enabled:
+                            type: boolean
+                            description: 管理接口是否已启用
+                          hint:
+                            type: string
+                            description: 未启用时的操作指引（启用时不出现）
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/admin/config:
+    get:
+      tags: [admin]      summary: 读取运行时配置（可改 + 只读）
+      description: |
+        ## persisted 是关键字段
+
+        `persisted: false` 表示当前配置**只在本次运行有效**，重启后
+        回落为命令行参数指定的值。UI 必须据此显示警告条，否则用户
+        会以为改动永久生效。
+
+        ## 可改 vs 只读
+
+        | 分组 | 内容 | 生效方式 |
+        | --- | --- | --- |
+        | `runtime` | 日志级别、并发、队列、配额 | **立即生效** |
+        | `readonly` | 目录、引擎路径、内存上限、地址、版本 | 需重启 |
+
+        只读项不做热改的原因是它们牵涉已加载的引擎子进程、已打开的
+        数据库、已绑定的监听端口。明确"重启才生效"比假装能热改诚实。
+
+        ## 权限
+
+        当前与推理接口**共用同一个 token**。这是已知简化：
+        独立 token 需要设计"如何把管理 token 交给用户"的流程。
+        记为待办，接口契约在此明确标注，让使用者知情。
+      responses:
+        "200":
+          description: 配置快照
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminConfig" }
+    put:
+      tags: [admin]
+      summary: 修改运行时配置
+      description: |
+        ## 必须提交完整配置
+
+        要求 `runtime` 全字段，而不是"只传变更项"。原因是零值语义
+        有歧义：`max_concurrent: 0` 是"改成 0"还是"不改"？管理界面
+        本来就是整表单提交，强制完整更简单也更安全。
+
+        ## 校验分两层
+
+        1. 字段范围（负数、空字符串、不认识的日志级别）→ 400
+        2. 跨字段约束（如 `reserved_interactive ≤ max_queue`）→ 400
+
+        第二层由调度器实现校验，不做在 API 层——否则同一套规则
+        会分叉成两处。
+
+        ## 失败不污染
+
+        校验或应用失败时，当前生效配置**保持原值**。这条很重要：
+        否则界面会显示"已改"而实际没生效，用户下次重启才发现配置丢了。
+
+        ## save 的语义
+
+        | `save` | 效果 | 失败时 |
+        | --- | --- | --- |
+        | `false`（默认） | 仅本次运行 | 返回 400，不改内存 |
+        | `true` | 应用 + 写 `$DATA_DIR/config.json` | **先应用成功才落盘**；落盘失败返回 500 但内存已是新值（如实告知） |
+
+        顺序不能反过来：那样配置文件会记录一个实际没生效的值。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [runtime]
+              properties:
+                runtime: { $ref: "#/components/schemas/AdminRuntimeConfig" }
+                save:
+                  type: boolean
+                  default: false
+                  description: 是否写入磁盘（重启后仍生效）
+      responses:
+        "200":
+          description: 应用后的完整配置
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminConfig" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "500":
+          description: 配置已生效但落盘失败（错误文案会说明）
+
+  /api/v1/admin/clients:
+    get:
+      tags: [admin]
+      summary: 按 client_id 的调用统计
+      description: |
+        用于回答"哪些应用在调用、谁在报错、平均多慢"。
+
+        `client_id` 只出现在请求体里（不在 URL 或头部），因此统计
+        只能在 handler 层记录，不能靠统一中间件。未传 `client_id`
+        的请求归入 `(anonymous)`——这是常见情况。
+
+        按请求数降序排列，最活跃的在前。
+      responses:
+        "200":
+          description: 客户端统计
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminClients" }
+
+  /api/v1/admin/logs:
+    get:
+      tags: [admin]
+      summary: 日志尾部（已脱敏）
+      description: |
+        ## 必须脱敏
+
+        日志会显示在浏览器里，用户可能在共享屏幕时展示。与诊断包
+        用同一套脱敏规则，避免两处规则分叉。
+
+        替换项：绝对路径 → `<path>`、token → `<redacted>`、
+        邮箱/手机/身份证 → 占位符。
+
+        ## 未启用文件日志不是错误
+
+        返回 200 + `note` 说明，而不是 4xx。把它当错误会让界面
+        显示一个并不存在的故障。
+      parameters:
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 200
+          description: 返回最后多少行（超出范围返回 400）
+      responses:
+        "200":
+          description: 日志尾部
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminLogs" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+
+  /api/v1/admin/system:
+    get:
+      tags: [admin]
+      summary: 系统概览（聚合）
+      description: |
+        ## 为什么聚合
+
+        管理页面首屏要展示硬件、资源、模型、队列、能力。分 4 个请求
+        会让"加载中"状态难以处理——部分成功部分失败时界面该显示
+        数据还是错误？
+
+        聚合后要么全有，要么明确报错。
+
+        ## recent_latency 的语义
+
+        是**进程启动以来的累计分布**，不是滑动窗口；跨接口按样本数
+        加权，只用来看量级。响应里的 `note` 会说明这两点——不说清
+        用户会以为"重启后变快"是优化生效。
+      responses:
+        "200":
+          description: 系统概览
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminSystem" }
+
+  /api/v1/admin/diagnostics:
+    get:
+      tags: [admin]
+      summary: 下载诊断包（zip）
+      description: |
+        返回 `application/zip` 附件，**不经过 Envelope 包装**——
+        二进制流无法包 JSON。
+
+        包内容（8 个文件）：
+
+        | 文件 | 内容 |
+        | --- | --- |
+        | `summary.json` | 生成时间与说明 |
+        | `config.json` | 配置（路径已抹用户段） |
+        | `hardware.json` | 硬件检测结果 |
+        | `stats.json` | 运行统计、能力状态、客户端统计 |
+        | `models.json` | 模型清单摘要（不含路径） |
+        | `metrics.txt` | Prometheus 指标（纯数值） |
+        | `logs-tail.txt` | 日志尾部（脱敏） |
+        | `README.txt` | 文件说明 |
+
+        ## 不含用户内容
+
+        **不包含**知识库文档内容、对话历史、用户文件的完整路径。
+        路径在日志里整条替换为 `<path>`（文件名本身就是用户内容），
+        在配置里只抹用户段（保留目录结构，便于排查"模型目录配错了"）。
+      responses:
+        "200":
+          description: 诊断包
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /api/v1/admin/token/rotate:
+    post:
+      tags: [admin]
+      summary: 重置 API token（危险操作）
+      description: |
+        ## 后果
+
+        旧 token **立即失效**，所有已连接的应用会收到 401，需重新
+        读取 discovery 文件。UI 必须二次确认。
+
+        ## 完整 token 只返回一次
+
+        之后接口只返回前 4 位（`masked`）。理由是读取接口能被录屏/
+        截图，而重置是用户主动触发的即时动作，此刻交出值是预期的。
+        每次都返回完整值等于泄露面没缩小。
+
+        ## 写文件失败则不切换
+
+        顺序是"先更新 discovery 文件，成功后才切换内存值"。反过来
+        若写盘失败，内存已是新值而文件还是旧值，所有正在运行的应用
+        会突然 401 且无法自动恢复。
+
+        该端点**仅在启用管理接口时存在**；未启用时返回 404。
+      responses:
+        "200":
+          description: 新 token（仅此一次完整返回）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/AdminRotateToken" }
+
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: OpenAI Chat Completions 兼容
+      description: |
+        ## 为什么单独实现序列化
+
+        官方 SDK 严格解析响应结构：少一个字段、多一层包装都会导致
+        反序列化失败。因此这一层：
+        - 成功响应是**裸对象**，不包 Envelope
+        - 错误是 `{"error":{"message","type","param","code"}}`
+
+        ## 不支持的字段
+
+        未知字段被忽略而不是报错——OpenAI 生态的客户端会带各种扩展
+        字段（`logit_bias`、厂商私有字段），严格拒绝会破坏"零改造接入"。
+
+        `n > 1` 明确拒绝：并发固定为 1，多候选在低配机上没有意义。
+
+        ## 不支持知识库
+
+        协议没有 `kb_ids` 字段，加了会破坏兼容性。
+        需要 RAG 请用 `/api/v1/chat`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                model:
+                  type: string
+                  description: 不校验，任意值均可（响应里返回实际模型）
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    required: [role, content]
+                    properties:
+                      role:
+                        type: string
+                        enum: [system, user, assistant, developer, tool]
+                      content:
+                        description: 字符串或内容块数组（仅支持 text 块）
+                max_tokens: { type: integer }
+                max_completion_tokens: { type: integer }
+                temperature: { type: number }
+                top_p: { type: number }
+                stream: { type: boolean }
+                response_format:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [text, json_object, json_schema]
+                    json_schema:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        schema: { type: object }
+      responses:
+        "200":
+          description: |
+            OpenAI 格式响应（**不是** Envelope）。
+            `stream: true` 时返回 SSE。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIChatResponse" }
+            text/event-stream:
+              schema:
+                type: string
+              description: |-
+                OpenAI 兼容的 SSE 流。每帧是 `data: {...}`，最后一帧
+                `data: [DONE]`。
+
+                **这里刻意不重复定义 schema**：该格式由 OpenAI 规范定义，
+                官方 SDK（openai-python / openai-node 等）已内置类型。
+                在本契约里再写一遍只会造成两处维护、逐步漂移。
+
+                需要类型时请用官方 SDK 的类型定义。本项目只保证：
+                响应能被官方 SDK 正常解析（不加额外包装、不删必填字段）。
+                本项目的扩展字段 `timings` 位于帧顶层，忽略未知字段的
+                客户端会自动跳过。
+        "400":
+          description: 参数错误（OpenAI 格式）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIErrorResponse" }
+        "503":
+          description: 无模型可用（OpenAI 格式）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIErrorResponse" }
+
+  /v1/models:
+    get:
+      tags: [openai]
+      summary: OpenAI 模型列表
+      description: |
+        返回 `{"object":"list","data":[...]}` 格式，兼容 OpenAI SDK。
+
+        `created` 字段用进程启动时间填充——模型没有真正的创建时间，
+        但部分客户端要求该字段非零。
+      responses:
+        "200":
+          description: 模型列表（OpenAI 格式）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, example: list }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        object: { type: string, example: model }
+                        created: { type: integer, format: int64 }
+                        owned_by: { type: string, example: local-ai-hub }
+        "401":
+          description: token 无效（OpenAI 格式）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIErrorResponse" }
+
+  /v1/embeddings:
+    post:
+      tags: [openai]
+      summary: OpenAI Embeddings（文本向量化）
+      description: |
+        OpenAI 兼容的向量化端点。底层是 `llama-server --embeddings`
+        （`multilingual-e5-small`），由 `-embedding-model` 参数启用。
+
+        ## input 支持三种形态
+
+        | 形态 | 支持 | 说明 |
+        | --- | --- | --- |
+        | `"文本"` | ✅ | 单条 |
+        | `["a","b"]` | ✅ | 批量 |
+        | `[1,2,3]`（token ID） | ❌ | 本服务不做分词，明确返回 400 |
+
+        ## encoding_format
+
+        | 取值 | 行为 |
+        | --- | --- |
+        | 空 / `float` | JSON 浮点数组 |
+        | `base64` | base64 编码的 **float32 小端**序列 |
+        | 其他 | 400 |
+
+        **base64 不是可选项**：OpenAI 官方 Node SDK 在不传该字段时
+        **默认发 base64**（更紧凑）。只支持 float 会导致官方 SDK
+        直接 400，那就不是"零改造接入"了。这一点是端到端用真实
+        SDK 验证时发现的。
+
+        ## 前缀语义（重要）
+
+        输入一律按**文档**处理（内部加 `passage: ` 前缀），与知识库
+        检索时的文档侧一致。
+
+        OpenAI 协议里没有 query/passage 之分，因此不给调用方选择。
+        需要 query 语义的场景请用 `/api/v1/search`，那里前缀由
+        检索器内部正确处理。
+
+        ## usage 是估算值
+
+        本地引擎不返回精确 token 数。响应里的 `usage` 按字符数
+        保守估算（每字符 1 token）。**不要用它做成本核算。**
+
+        为什么不填 0：0 会被部分 SDK 当作"免费"，算出荒谬的成本。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input:
+                  description: |
+                    字符串或字符串数组。token ID 数组不支持。
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+                model:
+                  type: string
+                  description: |
+                    不校验。本地只有一个 Embedding 模型，
+                    传任何名字都用同一个（与 `/v1/chat/completions` 一致）。
+                encoding_format:
+                  type: string
+                  enum: [float, base64]
+                  description: |
+                    缺省为 float。官方 Node SDK 会默认发 base64。
+                dimensions:
+                  type: integer
+                  description: |
+                    本地模型维度固定（e5-small 为 384），
+                    传了不匹配的值会被忽略而不是报错。
+      responses:
+        "200":
+          description: 向量列表（OpenAI 格式，**不是** Envelope）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data, model, usage]
+                properties:
+                  object:
+                    type: string
+                    enum: [list]
+                  model:
+                    type: string
+                    description: 实际使用的向量模型 ID
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [object, index, embedding]
+                      properties:
+                        object:
+                          type: string
+                          enum: [embedding]
+                        index:
+                          type: integer
+                          description: |
+                            与输入顺序对应。**必须按 index 而不是返回顺序
+                            组装**——顺序错乱会导致向量与文本错配，
+                            检索结果看似正常但内容完全对不上。
+                        embedding:
+                          description: |
+                            `encoding_format=float` 时是数字数组；
+                            `base64` 时是 base64 字符串（float32 小端）。
+                          oneOf:
+                            - type: array
+                              items: { type: number, format: float }
+                            - type: string
+                  usage:
+                    type: object
+                    properties:
+                      prompt_tokens: { type: integer }
+                      total_tokens: { type: integer }
+        "400":
+          description: |
+            参数错误（OpenAI 格式）：input 非法、token ID 数组、
+            未知 encoding_format、输入过长。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIErrorResponse" }
+        "501":
+          description: |
+            未配置 Embedding 模型。用 `-embedding-model` 启动可启用。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAIErrorResponse" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Runtime 生成的 token，位于 discovery 文件的 `token` 字段。
+
+        discovery 文件路径：
+        - Windows: `%LOCALAPPDATA%\LocalAIHub\runtime.json`
+        - Linux: `${XDG_DATA_HOME:-~/.local/share}/local-ai-hub/runtime.json`
+        - macOS: `~/.local-ai-hub/runtime.json`
+
+  parameters:
+    KBID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: 知识库 ID
+
+  responses:
+    Unauthorized:
+      description: token 无效或缺失
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+
+    InvalidRequest:
+      description: 参数非法（不应重试）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+
+    TooManyRequests:
+      description: |
+        队列已满或客户端配额用尽。按 `retry_after_ms` 退避后重试。
+
+        注意区分 `queue_full`（请求太多）与 `client_quota_exceeded`
+        （该客户端请求太多，其他客户端正常）。
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议等待秒数
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+
+    ServiceUnavailable:
+      description: 资源不足、模型不可用或未就绪（可重试）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+
+    HealthReport:
+      description: 健康报告
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Envelope"
+              - type: object
+                properties:
+                  data: { $ref: "#/components/schemas/HealthReport" }
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        统一响应信封（文档 19.1）。
+
+        **不适用于 `/v1/*`**：OpenAI 兼容层必须是裸对象。
+      required: [success, request_id]
+      properties:
+        success: { type: boolean }
+        request_id:
+          type: string
+          description: |
+            全链路追踪标识，同时出现在响应头 `X-Request-ID`。
+            用户报问题时提供它即可定位日志。
+        data:
+          description: 业务数据，结构随端点不同
+        model: { $ref: "#/components/schemas/ModelInfo" }
+        usage: { $ref: "#/components/schemas/Usage" }
+        warnings:
+          type: array
+          items: { type: string }
+          description: |
+            非致命提示（如上下文被裁剪）。
+            **调用方应向用户展示**——它可能解释了"结果为什么不太对"。
+        error: { $ref: "#/components/schemas/ErrorBody" }
+        knowledge: { $ref: "#/components/schemas/KnowledgeInfo" }
+
+    ErrorBody:
+      type: object
+      description: |
+        结构化错误（文档 19.2）。三个字段的组合决定 SDK 行为：
+        `retryable` 决定是否退避重试，`degradable` 决定是否可走
+        业务降级路径。只有 message 是不够的——SDK 无法从字符串
+        判断该重试还是该放弃。
+      required: [code, message, retryable, degradable]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - forbidden
+            - model_not_found
+            - not_found
+            - method_not_allowed
+            - queue_full
+            - client_quota_exceeded
+            - resource_limited
+            - model_unavailable
+            - capability_unmet
+            - internal_error
+          description: 稳定的错误标识，SDK 依赖它做分支判断，**不可变更**
+
+          `model_not_found` 与 `not_found` 刻意分开：前者要换模型或下载，
+          后者要检查 ID（知识库/文档/文件）。共用一个码会让调用方朝
+          错误方向排查。
+
+          `capability_unmet` 与 `resource_limited` 也刻意分开：后者是
+          "关掉其他程序再试"，前者是"关程序没用，得换模型或改配置"
+          （模型被白名单/能力要求挡住）。共用会让用户白折腾。
+        message: { type: string }
+        retryable: { type: boolean }
+        retry_after_ms: { type: integer, format: int64 }
+        degradable: { type: boolean }
+
+    ModelInfo:
+      type: object
+      description: |
+        `requested` 与 `actual` 分开是必要的：降级时两者不同，
+        业务方据此决定是否提示用户"结果质量可能下降"。
+      properties:
+        requested: { type: string }
+        actual: { type: string }
+        degraded: { type: boolean }
+        degrade_reason: { type: string }
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        ttft_ms:
+          type: integer
+          format: int64
+          description: |-
+            首字节耗时。
+
+            ⚠️ **非流式请求下它恒等于 total_ms**：非流式没有独立的
+            首字时刻，引擎只报总耗时。调用方不要用它评估首字延迟。
+            流式响应有真实值，见 `StreamUsageData`。
+        total_ms: { type: integer, format: int64 }
+        queue_wait_ms:
+          type: integer
+          format: int64
+          description: |
+            在调度队列中的等待时长。
+
+            单独暴露的原因：总耗时 = 排队 + 推理。不区分的话，
+            调用方看到"耗时 5 秒"无法判断该优化排队还是换小模型。
+
+            不加 omitempty：0（无排队）是有意义的信息。
+
+    KnowledgeInfo:
+      type: object
+      description: 本次调用如何使用知识库。用户有权知道回答基于哪些资料。
+      properties:
+        kb_ids:
+          type: array
+          items: { type: string }
+        used_chunks: { type: integer }
+        context_tokens: { type: integer }
+        retrieval_ms: { type: integer, format: int64 }
+        degraded: { type: boolean }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/KnowledgeSource" }
+        warnings:
+          type: array
+          items: { type: string }
+
+    KnowledgeSource:
+      type: object
+      properties:
+        index:
+          type: integer
+          description: 对应上下文中的 [资料 N] 编号
+        chunk_id: { type: string }
+        document_id: { type: string }
+        source: { type: string, description: 文件名 }
+        score: { type: number, format: float }
+
+    HealthReport:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [starting, ready, degraded, unavailable]
+          description: |
+            `degraded` 表示能服务但受限（如只能走规则引擎）——
+            仍应视为可用。
+        since: { type: integer, format: int64 }
+        uptime_seconds: { type: integer, format: int64 }
+        reason: { type: string }
+        checks:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/CheckResult" }
+
+    CheckResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        message: { type: string }
+
+    ModelSummary:
+      type: object
+      description: |
+        模型清单的对外视图。
+
+        刻意不直接暴露内部 manifest：后者含引擎版本约束等实现细节，
+        且未来会演进。对外用稳定结构，避免内部改动破坏契约。
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, example: llm }
+        arch: { type: string, example: granitehybrid }
+        quantization: { type: string, example: Q4_K_M }
+        context_length:
+          type: integer
+          description: |
+            模型**原生**上下文上限。实际运行时通常远小于它
+            （按内存预算缩减，见文档 21.3）。
+        languages:
+          type: array
+          items: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: |
+            用于判断能否承担某类任务：`summarization` / `classification` /
+            `extraction` / `qa` / `rag` / `tool_calling` / `reasoning` 等。
+        license: { type: string }
+        commercial_use:
+          type: string
+          description: |
+            商用许可状态。**必须核对**：部分模型（如 LFM）有营收门槛。
+        loaded:
+          type: boolean
+          description: 当前是否已加载（同一时刻只有一个）
+        size_bytes:
+          type: integer
+          format: int64
+          description: 模型文件总大小
+        present:
+          type: boolean
+          description: |-
+            模型文件是否已在本地（可加载）。
+
+            与 `loaded` 的区别：`present` 是"文件在磁盘上"，
+            `loaded` 是"已加载进内存"。下载完但未加载时
+            `present=true, loaded=false`。
+
+            判定容忍 size 字段的小偏差（<1% 或 <1 MiB）——
+            实测发现清单里的 size 可能与真实文件差几百字节，
+            严格比较会让可用模型显示为"未下载"。
+
+    ModelList:
+      type: object
+      properties:
+        models:
+          type: array
+          items: { $ref: "#/components/schemas/ModelSummary" }
+        active:
+          type: string
+          description: 当前加载的模型 ID，空表示无模型
+        total: { type: integer }
+
+    ChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/Message" }
+        max_tokens:
+          type: integer
+          description: 输出上限。0 表示用服务端默认值。
+        temperature:
+          type: number
+          description: 为 0 时用贪心解码（结果可复现）
+        quality:
+          type: string
+          enum: [fast, balanced, best]
+          description: 影响模型选择
+        deadline_ms:
+          type: integer
+          description: 本次请求的时间预算，超过则返回超时
+        allow_degrade:
+          type: boolean
+          description: |
+            缺省为 true（允许降级）。
+            涉及金额、权限、删除类操作应显式设为 false。
+        mission_critical:
+          type: boolean
+          description: |
+            该任务不允许降级。涉及金额、权限、删除类操作必须设 true。
+        json_schema:
+          type: object
+          description: |
+            启用约束解码（结构化输出）。这是首选手段，而非事后校验
+            （ADR 0006）。
+        enable_thinking:
+          type: boolean
+          description: |
+            Qwen3 系列的思考模式。**默认 false**——开启会把 token
+            预算先花在思考内容上，在常见的 max_tokens 设置下输出为空，
+            用户会以为模型坏了。
+        stream: { type: boolean }
+        priority:
+          type: string
+          enum: [interactive, normal, batch, background]
+          description: |
+            P0~P3。P0 有预留槽位，可抢占低优先级任务。
+            OpenAI 协议无优先级表达，走 `/api/v1/chat` 才可指定。
+        client_id:
+          type: string
+          description: 调用方标识，用于 per-client 配额。留空则不参与限制。
+        kb_ids:
+          type: array
+          items: { type: string }
+          description: |
+            要检索的知识库。传了即自动完成"检索 → 拼接 → 注入"。
+            空表示不用知识库。
+        knowledge_query:
+          type: string
+          description: |
+            覆盖默认检索查询。默认用最后一条 user 消息——用全部消息
+            拼接会把历史问题也当成检索意图，召回结果发散。
+        knowledge_mode:
+          type: string
+          enum: [hybrid, keyword, semantic]
+        context_tokens:
+          type: integer
+          description: 知识库上下文的 token 预算。0 表示自动（上下文的 35%）。
+        max_knowledge_chunks: { type: integer }
+        history_tokens:
+          type: integer
+          description: |
+            多轮历史可用的 token 预算。0 表示自动（上下文的 40%）。
+            超预算时从最旧的开始丢弃，但始终保留 system 与最近若干轮。
+        query_strategy:
+          type: string
+          enum: [auto, last_user, concat, llm]
+          description: |
+            检索查询构造策略。
+
+            `auto`（默认）：两路都评分，取更高者。实测 21 个用例全对。
+            `last_user`：只用最后一条 user 消息。
+            `concat`：拼接上一轮与当前。**单独使用有风险**——追问本身
+            完整时会被上一轮主题带偏（实测 5 例只中 1 例）。
+            `llm`：小模型改写。**实验特性**，实测 0.6B 在 8 例中错 4 例
+            且会编造答案，不建议生产使用。
+        knowledge_top_k:
+          type: integer
+          description: |
+            检索候选条数（默认 8）。比实际注入条数大：先多召回，
+            再由拼接按预算筛选。
+
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content: { type: string }
+
+    ChatResponse:
+      type: object
+      properties:
+        content: { type: string }
+        finish_reason:
+          type: string
+          description: '"stop" 正常，"length" 达到上限'
+        truncated:
+          type: boolean
+          description: |
+            便捷判断。达到长度上限意味着输出被截断，业务方需要知道，
+            否则会把不完整的结果当成完整的。
+
+    # ---------------------------------------------------------------------
+    # SSE 事件（/api/v1/chat 流式响应）
+    #
+    # 为什么用 oneOf + discriminator 而不是一个大对象：
+    #
+    #   生成器需要产出**类型安全**的流式客户端。用一个带所有可选字段
+    #   的大对象，调用方拿到 delta 事件时无法确定 Text 一定有值，
+    #   每个字段都得判空——那就等于没有类型。
+    #
+    # discriminator 的映射键是 `event` 字段的取值，生成器据此产生
+    # 联合类型（TypeScript 的 discriminated union / C# 的 pattern
+    # matching / Python 的 Union）。这是 OpenAPI 表达"多态事件流"
+    # 的标准做法。
+    # ---------------------------------------------------------------------
+
+    StreamEvent:
+      oneOf:
+        - $ref: "#/components/schemas/StreamQueuedEvent"
+        - $ref: "#/components/schemas/StreamMetaEvent"
+        - $ref: "#/components/schemas/StreamWarningEvent"
+        - $ref: "#/components/schemas/StreamDeltaEvent"
+        - $ref: "#/components/schemas/StreamUsageEvent"
+        - $ref: "#/components/schemas/StreamDoneEvent"
+        - $ref: "#/components/schemas/StreamErrorEvent"
+      discriminator:
+        propertyName: event
+        mapping:
+          queued: "#/components/schemas/StreamQueuedEvent"
+          meta: "#/components/schemas/StreamMetaEvent"
+          warning: "#/components/schemas/StreamWarningEvent"
+          delta: "#/components/schemas/StreamDeltaEvent"
+          usage: "#/components/schemas/StreamUsageEvent"
+          done: "#/components/schemas/StreamDoneEvent"
+          error: "#/components/schemas/StreamErrorEvent"
+      description: |-
+        SSE 帧的 JSON 结构。注意 SSE 传输层还包了一层 `data: ` 前缀，
+        且流以 `data: [DONE]` 结束（这一帧不是 JSON，解析器需特判）。
+
+    StreamQueuedEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [queued] }
+        data: { $ref: "#/components/schemas/StreamQueuedData" }
+
+    StreamQueuedData:
+      type: object
+      description: |-
+        排队位置。位置变化时服务端会重新推送（最多每 2 秒一次），
+        因此同一请求可能收到**多次** queued 事件，客户端应以最后一次为准。
+      properties:
+        ahead:
+          type: integer
+          description: 在该任务之前排队的任务数。0 表示下一个就轮到
+        ahead_same_priority:
+          type: integer
+          description: 同优先级中在它前面的任务数
+        priority:
+          type: string
+          enum: [interactive, normal, batch, background]
+        estimated_wait_ms:
+          type: integer
+          format: int64
+          description: 估算等待时间。0 表示无法估算（队列中还没有完成的样本）
+
+    StreamMetaEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [meta] }
+        data: { $ref: "#/components/schemas/StreamMetaData" }
+
+    StreamMetaData:
+      type: object
+      description: |-
+        流已建立。收到这条事件时引擎已就绪（不在排队、不在加载模型），
+        `delta` 紧随其后。
+      properties:
+        request_id: { type: string }
+        model:
+          type: string
+          description: 实际使用的模型。降级时与请求的不同
+        degraded: { type: boolean }
+        stream:
+          type: boolean
+          description: 恒为 true，保留字段便于与非流式响应结构对齐
+        knowledge:
+          allOf:
+            - $ref: "#/components/schemas/KnowledgeInfo"
+          description: |-
+            仅当请求带 `kb_ids` 时出现。
+
+            **完整结构**（含 `sources`）——与非流式响应的
+            `Envelope.knowledge` 一致。早期实现漏了 `sources`，
+            导致流式下前端做"引用来源"永远是空列表。
+
+    StreamWarningEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [warning] }
+        data: { $ref: "#/components/schemas/StreamWarningData" }
+
+    StreamWarningData:
+      type: object
+      properties:
+        warnings:
+          type: array
+          items: { type: string }
+          description: |-
+            裁剪与空结果等提示，**应展示给用户**——否则用户不知为何
+            没有引用资料，会怀疑知识库坏了。
+
+    StreamDeltaEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [delta] }
+        data: { $ref: "#/components/schemas/StreamDeltaData" }
+
+    StreamDeltaData:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 增量文本片段。客户端应直接拼接，不要按行处理
+
+    StreamUsageEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [usage] }
+        data: { $ref: "#/components/schemas/StreamUsageData" }
+
+    StreamUsageData:
+      type: object
+      description: |-
+        token 统计与延迟。与非流式的 `Usage` 有两处差异：
+
+        - `queue_wait_ms` **始终出现**（含 0）：SSE 头已发出，
+          无法用响应头传排队耗时，只能放事件里
+        - `prompt_tokens_may_be_incremental` 只在流式出现
+      properties:
+        prompt_tokens:
+          type: integer
+          description: |-
+            引擎报告的提示词 token 数。**缺省表示引擎未上报，不是 0**。
+
+            ⚠️ **不要直接当作完整 prompt 长度**。引擎报告的是本轮
+            实际处理的 token 数：prompt cache 命中已缓存前缀时只统计
+            新增部分，可能远小于完整长度；首次请求则等于完整长度。
+            引擎不报告缓存命中数，服务端无法区分这两种情况，因此
+            提供了 `prompt_tokens_may_be_incremental` 说明这种不确定性。
+        completion_tokens:
+          type: integer
+          description: 生成 token 数。缺省表示引擎未上报，不是 0
+        ttft_ms:
+          type: integer
+          format: int64
+          description: |-
+            首字节耗时。优先用引擎报告值（排除网络与序列化开销）。
+
+            若引擎未报告 TTFT，退化为本次请求的总耗时——此时它与
+            `total_ms` 相等，不代表真实的首字延迟。
+        total_ms: { type: integer, format: int64 }
+        queue_wait_ms:
+          type: integer
+          format: int64
+          description: |-
+            调度队列中的等待时长。始终输出。
+
+            总耗时 = 排队 + 推理。不区分的话，调用方看到"耗时 5 秒"
+            无法判断该优化排队还是换小模型。
+        prompt_tokens_may_be_incremental:
+          type: boolean
+          description: |-
+            为 true 时表示 `prompt_tokens` **可能**只是本轮新增部分
+            （prompt cache 命中），不是完整 prompt 长度。
+
+            流式下恒为 true——引擎不报缓存命中数，服务端无法区分
+            "首次请求的完整值"与"后续请求的增量值"。缺失或 false
+            **也**不能假设它是完整长度。
+
+            为什么用"可能"而不是"是"：实测同一请求首次 856 后续 4。
+            断言"一定是增量"对首次请求就是错的，调用方会误以为
+            上下文占用只有一半。要精确值需要引擎提供 cache_n。
+
+    StreamDoneEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [done] }
+        data: { $ref: "#/components/schemas/StreamDoneData" }
+
+    StreamDoneData:
+      type: object
+      properties:
+        finish_reason:
+          type: string
+          description: |-
+            `stop` 正常结束，`length` 达到 token 上限（内容被截断）。
+
+            达到上限意味着结果不完整，业务方需要知道——否则会把
+            半截回答当成完整答案。
+
+    StreamErrorEvent:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, enum: [error] }
+        data: { $ref: "#/components/schemas/StreamErrorData" }
+
+    StreamErrorData:
+      type: object
+      description: |-
+        流中断。注意这里的 `code` **不是** Envelope 的错误码体系——
+        错误发生在 SSE 头已发出之后，HTTP 状态码已固化为 200，
+        只能用事件表达。
+      properties:
+        code:
+          type: string
+          enum: [queue_cancelled, stream_failed]
+          description: |-
+            `queue_cancelled`：排队期间客户端断开或超时
+            `stream_failed`：引擎流中断
+        message: { type: string }
+
+    KBSummary:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        document_count: { type: integer }
+        chunk_count: { type: integer }
+        embedded_count: { type: integer }
+        created_at: { type: integer, format: int64 }
+
+    KBList:
+      type: object
+      properties:
+        bases:
+          type: array
+          items: { $ref: "#/components/schemas/KBSummary" }
+        count: { type: integer }
+
+    CreateKBRequest:
+      type: object
+      required: [name]
+      properties:
+        id:
+          type: string
+          description: |
+            可省略，省略时自动生成。若指定，只能包含字母、数字、
+            短横线与下划线——因为 ID 会拼进托管目录路径，
+            允许 `..` 或 `/` 会构成路径穿越风险。
+        name: { type: string, example: 售后支持库 }
+        description: { type: string }
+
+    KnowledgeBaseRef:
+      type: object
+      description: 创建知识库后的引用。只回显已确认落库的字段。
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+
+    DeletedResource:
+      type: object
+      description: 删除操作的确认。
+      properties:
+        deleted:
+          type: string
+          description: 被删除的资源 ID
+
+    DeletedDocument:
+      type: object
+      properties:
+        deleted: { type: string }
+        file_removed:
+          type: boolean
+          description: |-
+            是否删除了托管副本（EXTERNAL 模式恒为 false——
+            绝不删除用户原文件）。
+
+    KBStats:
+      type: object
+      properties:
+        kb_id: { type: string }
+        document_count: { type: integer }
+        chunk_count: { type: integer }
+        embedded_count:
+          type: integer
+          description: 已有有效向量的切片数
+        stale_count:
+          type: integer
+          description: 失效向量数（换了 Embedding 模型）
+        vectorize:
+          allOf:
+            - $ref: "#/components/schemas/VectorizeProgress"
+          description: 向量化进度。查询失败时该字段缺省，不影响主统计。
+
+    VectorizeResult:
+      type: object
+      properties:
+        kb_id: { type: string }
+        vectorized:
+          type: integer
+          description: 本次向量化的切片数（同步模式）
+        started:
+          type: boolean
+          description: 是否已启动后台任务（异步模式）
+        note:
+          type: string
+          description: 异步模式下的提示文本
+
+    DocumentList:
+      type: object
+      properties:
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentSummary" }
+        count: { type: integer }
+
+    VectorizeProgress:
+      type: object
+      properties:
+        total_chunks: { type: integer }
+        embedded_chunks: { type: integer }
+        pending_chunks: { type: integer }
+        stale_chunks:
+          type: integer
+          description: 失效向量数（换了 Embedding 模型，待重建）
+        model: { type: string }
+        running: { type: boolean }
+
+    DocumentSummary:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        file_type: { type: string }
+        storage_mode:
+          type: string
+          enum: [MANAGED, EXTERNAL]
+        file_size: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [ACTIVE, MISSING, MODIFIED, PENDING, PROCESSING, FAILED]
+        index_status:
+          type: string
+          enum: [PENDING, READY, PARTIAL, FAILED]
+        chunk_count: { type: integer }
+        error: { type: string }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+
+    ImportRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: |
+            源文件**绝对路径**。相对路径的基准取决于服务进程的工作目录，
+            用户无法预期。
+        name:
+          type: string
+          description: 显示名，省略则用文件名
+        mode:
+          type: string
+          enum: [MANAGED, EXTERNAL]
+          default: MANAGED
+          description: |
+            `MANAGED`：复制文件到 Runtime 数据目录。原文件删除/移动
+            不影响知识库。
+            `EXTERNAL`：只记录路径。原文件失效会导致 MISSING。
+        password:
+          type: string
+          description: |
+            加密 PDF 的密码。目前仅 PDF 支持。
+
+            **不传也可以先试**："只限制打印"类 PDF 是空用户密码 +
+            非空所有者密码，任何阅读器都能直接打开——解析器会自动
+            用空密码尝试。
+
+            密码不写入数据库，只在本次导入的内存中使用。
+        update_document_id:
+          type: string
+          description: |
+            非空表示**更新已有文档**而非新建。此时做增量 diff：
+            未变更的切片保留向量，只重新向量化变更部分。
+
+            若指定的文档不存在会报错，不静默新建。
+
+    ImportResult:
+      type: object
+      properties:
+        document_id: { type: string }
+        chunk_count: { type: integer }
+        content_runes:
+          type: integer
+          description: 解析出的字符数
+        duplicate:
+          type: boolean
+          description: 内容相同的已有文档，本次未重复导入
+        existing_id:
+          type: string
+          description: duplicate 为 true 时指向已有文档
+        note: { type: string }
+        diff:
+          allOf:
+            - $ref: "#/components/schemas/ImportDiff"
+          description: |
+            增量更新的差异（仅 update_document_id 时返回）。
+
+            `needs_embedding` 为 true 时才需要触发向量化——
+            只删除不需要（没有新文本要嵌入）。
+
+    ImportDiff:
+      type: object
+      properties:
+        added: { type: integer }
+        updated: { type: integer }
+        deleted: { type: integer }
+        unchanged: { type: integer }
+        needs_embedding: { type: boolean }
+        summary:
+          type: string
+          example: 变更 1，未变 2
+
+    SearchRequest:
+      type: object
+      required: [query, kb_ids]
+      properties:
+        query: { type: string }
+        kb_ids:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 10
+          description: 必填。不支持全库检索（隔离要求）。
+        top_k: { type: integer, default: 5, maximum: 100 }
+        mode:
+          type: string
+          enum: [hybrid, keyword, semantic]
+          default: hybrid
+        build_context:
+          type: boolean
+          description: 为 true 时额外返回拼好的 RAG 上下文
+        context_tokens: { type: integer }
+        max_chunks: { type: integer }
+
+    SearchResponse:
+      type: object
+      properties:
+        query: { type: string }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/SearchHit" }
+        mode:
+          type: string
+          description: 实际使用的模式（可能因降级与请求不同）
+        degraded: { type: boolean }
+        note: { type: string }
+        total_ms: { type: integer, format: int64 }
+        context: { $ref: "#/components/schemas/RAGContext" }
+
+    SearchHit:
+      type: object
+      properties:
+        chunk_id: { type: string }
+        document_id: { type: string }
+        kb_id: { type: string }
+        ordinal: { type: integer }
+        text: { type: string }
+        score:
+          type: number
+          format: float
+          description: |
+            RRF 融合分数。**跨查询不可比**——不同查询的候选集不同，
+            分数绝对值没有意义，只用于同一次结果内排序。
+        keyword_rank:
+          type: integer
+          description: 在关键词通道的排名（0 表示未命中该通道）
+        semantic_rank:
+          type: integer
+          description: 在语义通道的排名（0 表示未命中该通道）
+
+    RAGContext:
+      type: object
+      description: |
+        拼好的上下文，可直接放入 prompt。
+
+        结构：防注入声明 → 资料区标题 → 逐条资料（带 `<<< >>>` 边界）
+        → 回答指令。
+
+        **资料内容不过滤只隔离**：过滤会破坏正常文档（安全资料里必然
+        出现"忽略权限检查"），而且会造成"已经安全了"的错觉。
+      properties:
+        text: { type: string }
+        estimated_tokens:
+          type: integer
+          description: 估算值，恒定偏保守（低估会导致引擎拒绝）
+        budget_tokens: { type: integer }
+        fixed_overhead_tokens:
+          type: integer
+          description: |-
+            防注入声明 + 资料区标题 + 回答指令占用的 token。
+            预算再小也省不掉，因此调用方应保证 `context_tokens`
+            明显大于它，否则一条资料都放不进去。
+        used_chunks: { type: integer }
+        dropped_chunks: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+          description: |
+            裁剪与空结果提示。**调用方应展示给用户**——
+            否则用户不知为何没有引用资料，会怀疑知识库坏了。
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/KnowledgeSource" }
+
+    RuleEngineResponse:
+      type: object
+      properties:
+        intent: { type: string }
+        fields:
+          type: object
+          additionalProperties: { type: string }
+        method:
+          type: string
+          enum: [rule, keyword, none]
+          description: |
+            结果来源。必然不是模型——用户有权知道这是关键词匹配。
+        confidence:
+          type: number
+          format: double
+          description: 匹配置信度（与模型的置信度不可比，仅用于规则间排序）
+        explanation: { type: string }
+        matched_rules:
+          type: array
+          items: { type: string }
+
+    StatsResponse:
+      type: object
+      properties:
+        http: { type: object }
+        llm: { type: object }
+        queue: { type: object }
+        engine: { type: object }
+        degrade: { type: object }
+        resource: { type: object }
+        live:
+          type: object
+          description: |
+            实时查询的状态，与累计指标互为交叉验证。
+            若两者不一致，说明埋点有遗漏。
+          properties:
+            model: { $ref: "#/components/schemas/ModelStats" }
+            engine: { $ref: "#/components/schemas/EngineStats" }
+            scheduler: { $ref: "#/components/schemas/SchedulerStats" }
+            resource:
+              type: object
+              properties:
+                pressure: { type: string }
+                available_bytes: { type: integer, format: int64 }
+                total_bytes: { type: integer, format: int64 }
+                available_percent: { type: integer }
+
+    ModelStats:
+      type: object
+      properties:
+        loaded: { type: string }
+        loading: { type: string }
+        engine_pid: { type: integer }
+        engine_state: { type: string }
+        enforcement:
+          type: string
+          description: |
+            内存硬限额的执行状态。`soft_only` 意味着 AI 可能挤占
+            其他程序的内存，用户应据此决定是否降级使用。
+          enum: [enforced, soft_only, disabled]
+
+    EngineStats:
+      type: object
+      properties:
+        count:
+          type: integer
+          description: 引擎子进程数。V1 只应有 1 个；大于 1 意味着泄漏。
+        restarts_total: { type: integer, format: int64 }
+        last_exit_reason: { type: string }
+
+    SchedulerStats:
+      type: object
+      properties:
+        queued: { type: integer }
+        running: { type: integer }
+        by_priority:
+          type: object
+          additionalProperties: { type: integer }
+          description: 按 P0~P3 的排队数
+        rejected_total: { type: integer, format: int64 }
+        cancelled_total: { type: integer, format: int64 }
+        completed_total: { type: integer, format: int64 }
+        failed_total: { type: integer, format: int64 }
+
+    Capability:
+      type: object
+      description: |-
+        这台机器能做什么。判据只认模型清单里rag.qualified（实测结论），
+        不认厂商声明的 recommended_for——实测发现后者不可靠。
+      required: [level, rag_enabled, chat_enabled]
+      properties:
+        level:
+          type: string
+          enum: [full, chat_only, rule_only]
+          description: |-
+            `full`：对话与 RAG 都可用
+            `chat_only`：对话可用，但没有实测达标的 RAG 模型
+            `rule_only`：连基准模型都装不下，只有规则引擎
+        reason:
+          type: string
+          description: 一句话说明当前为何是该等级
+        rag_enabled:
+          type: boolean
+          description: |-
+            知识库检索是否可用。为 false 时**不要传 kb_ids**——
+            服务端会忽略，但用户会以为检索过了。
+        chat_enabled:
+          type: boolean
+          description: |-
+            模型对话是否可用。为 false 时只能走规则引擎（关键词匹配），
+            这不是"AI 降级"而是"没有 AI"。
+        available_bytes:
+          type: integer
+          format: int64
+          description: 评估时的可用内存
+        baseline_need_bytes:
+          type: integer
+          format: int64
+          description: |-
+            基准模型（Qwen3-0.6B）的内存需求。
+
+            用于向用户解释"差多少"：可用 400 MiB 而需要 1.0 GiB，
+            比只说"内存不足"更有用。
+        rag_model:
+          type: string
+          description: 当前将用于 RAG 的模型 ID（空表示没有）
+        warnings:
+          type: array
+          items: { type: string }
+          description: |-
+            需要展示给用户的提示，**不要静默丢弃**。
+            例如"内存不足：当前可用 400 MiB，加载最小模型需 1.0 GiB"。
+
+    ResourceStatus:
+      type: object
+      properties:
+        pressure:
+          type: string
+          enum: [NORMAL, LIMITED, BUSY, CRITICAL]
+        available_bytes: { type: integer, format: int64 }
+        total_bytes: { type: integer, format: int64 }
+        available_percent: { type: integer }
+        reason: { type: string }
+        consumers:
+          type: array
+          description: 占用内存最多的其他程序（已排除 Runtime 自身）
+          items:
+            type: object
+            properties:
+              pid: { type: integer }
+              name: { type: string }
+              bytes: { type: integer, format: int64 }
+              readable_size: { type: string }
+        advice:
+          type: object
+          description: 给用户的行动建议（仅压力等级需要警告时返回）
+          properties:
+            message: { type: string }
+            actions:
+              type: array
+              items:
+                type: object
+                properties:
+                  kind: { type: string }
+                  text: { type: string }
+                  detail: { type: string }
+        enforcement:
+          type: string
+          enum: [enforced, soft_only, disabled]
+        enforcement_note: { type: string }
+        capability:
+          allOf:
+            - $ref: "#/components/schemas/Capability"
+          description: |-
+            这台机器能做什么。与压力等级并列展示——
+            用户一次就能看到"紧张程度"与"能用什么"。
+
+            未提供能力评估的部署下该字段缺省。
+        idle:
+          allOf:
+            - $ref: "#/components/schemas/IdleStatus"
+          description: |-
+            空闲卸载状态。未启用推理时该字段缺省。
+
+    IdleStatus:
+      type: object
+      description: |-
+        空闲卸载（方案 21.7）的当前状态。
+
+        **必须展示 `user_idle_detectable` 与 `last_reason`**：
+        用户看到"模型一直不卸载"时会怀疑功能失效，看到
+        `user_idle_detectable: false` 才能明白是平台不支持。
+
+        ## 卸载需要两个条件同时满足
+
+        1. 模型空闲 ≥ `unload_after_seconds`
+        2. 用户空闲 ≥ `user_idle_after_seconds`
+
+        只有第一条不够：模型空闲（没人调用）不等于用户离开。
+        用户可能正开着文档准备提问，此时卸载会让他下次点击
+        等重新加载（1.5B 约 2 秒），而多占 1.6 GiB 一会儿
+        的代价远小于这个等待。
+      properties:
+        enabled:
+          type: boolean
+          description: 自动卸载是否生效（有模型加载且阈值 > 0）
+        model_idle_seconds:
+          type: integer
+          description: 模型已空闲秒数（距最后一次推理）
+        unload_after_seconds:
+          type: integer
+          description: 模型空闲卸载阈值
+        user_idle_after_seconds:
+          type: integer
+          description: 要求用户空闲的阈值
+        user_idle_detectable:
+          type: boolean
+          description: |-
+            平台是否支持检测用户活动。
+
+            **为 false 时自动卸载永不触发**（保守策略：
+            判断不了就当作用户在忙，不卸载）。
+            Linux / macOS 当前为 false。
+        user_idle_seconds:
+          type: integer
+          description: 用户已空闲秒数（检测不到时为 0）
+        user_idle_source:
+          type: string
+          description: |-
+            检测来源说明。Windows 为 `GetLastInputInfo`；
+            不支持时给出原因（如 `no graphical session (HEADLESS)`）。
+        last_reason:
+          type: string
+          description: |-
+            最近一次判断的依据，回答"为什么没卸载"。
+            典型值：`model still recently used (15s)`、
+            `user is active (2s)`、
+            `user activity unknown, keeping model loaded`。
+        unloads_total:
+          type: integer
+          format: int64
+          description: 累计因空闲而卸载的次数
+
+    SubmittedTask:
+      type: object
+      description: |-
+        `async: true` 时的响应（HTTP 202）。
+
+        用 202 而不是 200：请求已被**接受**但尚未完成，
+        这是 202 的准确定义。客户端的重试逻辑可据此区分。
+      required: [task_id, status, kind]
+      properties:
+        task_id:
+          type: string
+          example: task_a1b2c3d4e5f6a7b8
+        status:
+          type: string
+          enum: [queued, running]
+        kind:
+          type: string
+          enum: [model_load, model_unload, vectorize]
+        created_at:
+          type: integer
+          format: int64
+        poll_interval_ms:
+          type: integer
+          description: |-
+            建议的轮询间隔。模型加载 1000ms、向量化 2000ms——
+            依据是任务的实际耗时特征，让客户端不必自己猜。
+        note:
+          type: string
+          description: 说明如何查询与取消
+
+    Task:
+      type: object
+      description: |-
+        任务状态快照。所有字段都是值拷贝，拿到后不会因后续状态变化
+        而看到半更新的结构。
+      required: [id, status, kind, created_at]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [queued, running, completed, failed, cancelled]
+        kind:
+          type: string
+          enum: [model_load, model_unload, vectorize]
+        created_at: { type: integer, format: int64 }
+        started_at:
+          type: integer
+          format: int64
+          description: 开始执行时间，未开始则为 0（省略）
+        finished_at:
+          type: integer
+          format: int64
+          description: 结束时间，未结束则为 0（省略）
+        result:
+          description: |-
+            成功时的结果（结构随 kind 而定）。
+            例如 model_load 返回 `{"model_id":"..."}`，
+            vectorize 返回 `{"kb_id":"...","vectorized":42}`。
+        error:
+          type: object
+          description: 失败原因（仅 failed 状态）
+          properties:
+            code:
+              type: string
+              description: |-
+                稳定标识。`resource_limited` 表示可重试（如内存不足）；
+                其余（`internal_error` 等）重试无意义。
+            message: { type: string }
+            retryable: { type: boolean }
+        progress:
+          type: object
+          description: |-
+            执行进度（仅能分步的操作提供）。
+
+            模型加载**不提供进度**——引擎不报告这个信息，
+            假装有进度是欺骗。
+          properties:
+            done: { type: integer }
+            total:
+              type: integer
+              description: 总工作量，0 表示无法确定
+
+    AdminRuntimeConfig:
+      type: object
+      description: |-
+        可热改的运行时配置。改动立即影响**后续**请求，
+        不影响正在执行的任务。
+
+        每项都有明确范围；非法值返回 400 且不污染当前配置。
+      required: [log_level, max_concurrent, max_queue, reserved_interactive, client_max_queued, client_max_concurrent]      properties:
+        log_level:
+          type: string
+          enum: [debug, info, warn, error]
+          description: |-
+            日志级别。子日志器共享同一个 core，因此改动对所有组件
+            立即生效（无需重启）。
+
+            日志文件路径**不可热改**——文件句柄已打开。
+        max_concurrent:
+          type: integer
+          minimum: 1
+          description: |-
+            同时执行的任务数上限。低配机应保持 1：并行推理只会让
+            每个请求都变慢，吞吐并不会提升（实测 4/20 并发吞吐
+            都恒定在 1.1~1.3 req/s）。
+        max_queue:
+          type: integer
+          minimum: 1
+          description: |-
+            队列总长度上限。超限直接返回 429 queue_full +
+            Retry-After，禁止无限排队。
+        reserved_interactive:
+          type: integer
+          minimum: 0
+          description: |-
+            P0（interactive）独占的预留槽位，不参与其他优先级排队。
+
+            注意：预留只保证 P0 **不被 queue_full 拒绝**，
+            不保证它能立即拿到执行槽位——调度器只能取消排队中的
+            任务，不能中断正在执行的（llama.cpp 不支持 token 级中断）。
+        client_max_queued:
+          type: integer
+          minimum: 1
+          description: |-
+            单客户端在队列中的最大任务数。防止一个批量 Embedding
+            的客户端打满队列、饿死他人的交互请求。
+        client_max_concurrent:
+          type: integer
+          minimum: 1
+          description: 单客户端同时执行的最大任务数
+
+        idle_unload_seconds:
+          type: integer
+          minimum: 0
+          description: |-
+            模型空闲多少秒后卸载。0 表示不自动卸载。
+
+            ## 与 user_idle_seconds 是"且"的关系
+
+            不同用户的使用模式差异极大：
+
+            | 场景 | 建议 |
+            | --- | --- |
+            | 偶尔用一次 AI | 都调小（如 60 / 120），尽快还内存 |
+            | 频繁使用 | 调大或设 0，让模型常驻省等待 |
+            | 专用机器 | `user_idle_seconds` 设 0，只看模型空闲 |
+        user_idle_seconds:
+          type: integer
+          minimum: 0
+          description: |-
+            要求用户空闲多少秒后才允许卸载。
+
+            **为什么不能只看模型空闲**：模型空闲（没人调用）不等于
+            用户离开。用户可能正开着文档准备提问，此时卸载会让他
+            下次点击等重新加载（1.5B 约 2 秒），而多占一会儿内存
+            的代价远小于这个等待。
+
+            **平台不支持检测时该值无效**：Windows 用 `GetLastInputInfo`；
+            Linux/macOS 未实现（与零 CGO/零依赖冲突），此时
+            自动卸载**永不触发**（保守：判断不了就当用户在用）。
+
+        allowed_model_ids:
+          type: array
+          items: { type: string }
+          description: |-
+            白名单：只允许加载/降级到这些模型。空表示不限制。
+
+            ## 手动加载也受此约束
+
+            用户设白名单是为了防止业务悄悄用错模型。若手动加载
+            能绕过，约束就形同虚设——而且会形成更隐蔽的问题：
+            一次手动加载之后当前模型已违规，但后续降级仍在白名单内
+            选择，用户完全看不出来。
+        require_capabilities:
+          type: array
+          items: { type: string }
+          description: |-
+            候选必须全部具备的能力，如 `["rag"]`。空表示不限制。
+
+            ## rag 只认实测结论
+
+            勾 RAG 时只认清单里的 `rag.qualified`，**不看**厂商声明
+            的 `capabilities`。
+
+            实测证据：Granite 两代都标了 rag，实测只有 6/13 与 7/13；
+            而厂商没标的 Qwen2.5-1.5B 实测 13/13。按声明判断会选错。
+
+            ## 设了能力要求就不能退化到规则引擎
+
+            规则引擎只做关键词匹配。对要求 RAG 的业务，退化到规则
+            引擎等于给出错误答案——比报错危险，因为用户会相信它。
+            因此只要设了能力要求，无法满足时一定拒绝。
+        reject_if_unavailable:
+          type: boolean
+          default: false
+          description: |-
+            能力要求无法满足时**拒绝请求**，而不是降级到不满足要求的
+            模型或规则引擎。
+
+            默认 false 保持向后兼容（老配置行为不变）。
+            但涉及 RAG、金额、权限的业务应设为 true。
+
+    AdminReadOnlyConfig:
+      type: object
+      description: |-
+        改了**必须重启**才生效的配置。
+
+        不做热改的原因：它们牵涉已加载的引擎子进程、已打开的
+        数据库、已绑定的监听端口。热改要么无法真正生效（造成
+        "看着改了其实没变"），要么需要复杂的重建流程。
+      properties:
+        registry_dir:
+          type: string
+          description: 模型清单目录
+        models_dir:
+          type: string
+          description: gguf 模型文件目录
+        llama_server:
+          type: string
+          description: 引擎可执行文件路径
+        engine_mem_limit_mb:
+          type: integer
+          format: int64
+          description: |-
+            引擎内存硬上限（MiB），0 表示按可用内存自动计算。
+
+            这是**份额**上限（引擎最多能用多少）。若模型需求更大，
+            加载时会按模型校准——否则引擎会在加载途中被 OS 杀掉，
+            表现为"加载失败"而非"内存不足"。
+        embedding_model:
+          type: string
+          description: Embedding 模型路径，空表示禁用语义检索
+        knowledge_dir:
+          type: string
+          description: 知识库数据目录
+        base_url:
+          type: string
+          description: 实际监听地址（含动态端口）
+        version:
+          type: string
+          description: Runtime 版本
+
+    AdminConfig:
+      type: object
+      required: [runtime, readonly, persisted, can_persist]
+      properties:
+        runtime: { $ref: "#/components/schemas/AdminRuntimeConfig" }
+        readonly: { $ref: "#/components/schemas/AdminReadOnlyConfig" }
+        persisted:
+          type: boolean
+          description: |-
+            当前配置是否已写入磁盘。
+
+            **UI 必须据此显示警告条**：false 时提示"仅本次运行有效，
+            重启后恢复为命令行参数指定的值"。漏了这条用户会以为
+            改动永久生效。
+        can_persist:
+          type: boolean
+          description: 是否支持保存到磁盘（数据目录不可用时为 false）
+        config_path:
+          type: string
+          description: 配置文件路径（供界面展示"存在哪"）
+        note:
+          type: string
+          description: 关于持久化状态的说明文案（未持久化时必有）
+
+    AdminClientInfo:
+      type: object
+      required: [client_id, requests, errors, avg_ms, last_seen]
+      properties:
+        client_id:
+          type: string
+          description: |-
+            调用方标识。未传 client_id 的请求归入 "(anonymous)"——
+            这是常见情况，多数调用方不传它。
+        requests:
+          type: integer
+          format: int64
+        errors:
+          type: integer
+          format: int64
+        avg_ms:
+          type: integer
+          format: int64
+          description: 平均耗时（毫秒），含排队
+        last_seen:
+          type: integer
+          format: int64
+          description: 最后一次调用时间（Unix 秒）
+
+    AdminClients:
+      type: object
+      required: [clients, total_requests, uptime_seconds]
+      properties:
+        clients:
+          type: array
+          description: 按请求数降序排列
+          items: { $ref: "#/components/schemas/AdminClientInfo" }
+        total_requests:
+          type: integer
+          format: int64
+        uptime_seconds:
+          type: integer
+          format: int64
+
+    AdminLogs:
+      type: object
+      required: [lines, truncated]
+      properties:
+        lines:
+          type: array
+          description: |-
+            日志行，**已脱敏**：绝对路径 → `<path>`、
+            token → `<redacted>`、邮箱/手机/身份证 → 占位符。
+          items: { type: string }
+        truncated:
+          type: boolean
+          description: 是否因行数或字节上限丢弃了更早的行
+        note:
+          type: string
+          description: 说明（如"未启用文件日志"）
+
+    AdminLatencySummary:
+      type: object
+      description: |-
+        耗时分布摘要。
+
+        **语义限制**：进程启动以来的累计分布（非滑动窗口）；
+        跨接口按样本数加权，只用来看量级。要精确定位某类请求的
+        耗时，应查 `/api/v1/stats` 的分接口数据。
+      properties:
+        p50_ms: { type: number }
+        p90_ms: { type: number }
+        p99_ms: { type: number }
+        count:
+          type: integer
+          format: int64
+          description: 样本数
+        note:
+          type: string
+          description: 必须向用户说明上面的语义限制
+
+    AdminSystem:
+      type: object
+      description: |-
+        系统概览聚合。分开调 4 个接口会让"加载中"状态难以处理——
+        部分成功部分失败时界面该显示数据还是错误？
+      properties:
+        hardware:
+          type: object
+          description: 硬件检测结果（Hardware Profile，结构随平台而异）
+        resource:
+          type: object
+          properties:
+            pressure:
+              type: string
+              enum: [NORMAL, LIMITED, BUSY, CRITICAL]
+            available_bytes: { type: integer, format: int64 }
+            total_bytes: { type: integer, format: int64 }
+            available_percent: { type: integer }
+            reason: { type: string }
+        model: { $ref: "#/components/schemas/ModelStats" }
+        scheduler: { $ref: "#/components/schemas/SchedulerStats" }
+        capability: { $ref: "#/components/schemas/Capability" }
+        enforcement:
+          type: string
+          enum: [enforced, soft_only, disabled]
+        enforcement_note: { type: string }
+        recent_latency: { $ref: "#/components/schemas/AdminLatencySummary" }
+
+    AdminRotateToken:
+      type: object
+      required: [token, masked, note]
+      properties:
+        token:
+          type: string
+          description: |-
+            **完整新 token，仅此一次返回**。之后只能看到前 4 位。
+            客户端必须立即保存。
+        masked:
+          type: string
+          description: 掩码形式（如 `laih_abcd****`），用于界面展示
+        note:
+          type: string
+          description: 后果说明（旧 token 已失效、需重新读取 discovery）
+
+    OpenAIChatResponse:
+      type: object
+      description: |
+        严格 OpenAI 格式。**不能**包 Envelope——官方 SDK 会解析失败。
+      properties:
+        id: { type: string, example: chatcmpl-req_xxx }
+        object: { type: string, example: chat.completion }
+        created: { type: integer, format: int64 }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message:
+                type: object
+                properties:
+                  role: { type: string, example: assistant }
+                  content: { type: string }
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter]
+        usage:
+          type: object
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+        system_fingerprint:
+          type: [string, "null"]
+
+    OpenAIErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              example: invalid_request_error
+            param: { type: [string, "null"] }
+            code: { type: [string, "null"] }

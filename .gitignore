@@ -1,0 +1,16 @@
+# 编译产物
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# 覆盖率报告
+coverage.txt
+coverage.html
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

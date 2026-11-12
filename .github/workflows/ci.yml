@@ -91,10 +91,11 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # 运行时依赖为空，所以只装开发工具。
+      # tomli 是给 3.9/3.10 用的 tomllib 后备（校验脚本需要）。
       - name: 安装开发依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" ruff
+          pip install -e ".[dev]" ruff tomli
 
       - name: ruff
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
@@ -110,26 +111,14 @@ jobs:
 
       # 零依赖是设计约束，必须在 CI 里守住：一旦有人加了一条
       # dependencies，这里会立刻失败。
+      #
+      # 用独立脚本而不是内联 shell + python -c：多行源码经 bash 传给
+      # `python -c` 时换行与缩进会被保留，Python 报 IndentationError，
+      # 最终拿到空串并报出"dependencies 应为空"这种完全误导的信息。
+      # 详见 scripts/check_no_deps.py 的注释。
       - name: 校验零运行时依赖
         if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          count=$(python -c "
-          import tomllib
-          with open('pyproject.toml','rb') as f:
-              d = tomllib.load(f)
-          print(len(d['project'].get('dependencies', [])))
-          " 2>/dev/null || python -c "
-          import tomli as tomllib
-          with open('pyproject.toml','rb') as f:
-              d = tomllib.load(f)
-          print(len(d['project'].get('dependencies', [])))
-          ")
-          if [ \"$count\" != \"0\" ]; then
-            echo \"::error::pyproject.toml 的 dependencies 应为空（零依赖是设计约束）\"
-            exit 1
-          fi
-          echo \"✓ 零运行时依赖\"
+        run: python scripts/check_no_deps.py
 
   # 打包检查：构建不出来等于发不了版。
   python-package:
@@ -146,23 +135,7 @@ jobs:
       - run: pip install build
       - run: python -m build --wheel --outdir dist
       - name: 校验包内含 py.typed 与 LICENSE
-        shell: bash
-        run: |
-          python - <<'PY'
-          import glob, sys, zipfile
-          wheels = glob.glob("dist/*.whl")
-          if len(wheels) != 1:
-              sys.exit(f"应恰好产出一个 wheel，实际 {wheels}")
-          with zipfile.ZipFile(wheels[0]) as z:
-              names = z.namelist()
-          need = ["localai/py.typed"]
-          missing = [n for n in need if n not in names]
-          if missing:
-              sys.exit(f"wheel 缺少 {missing}")
-          if not any("licenses/LICENSE" in n for n in names):
-              sys.exit("wheel 缺少 LICENSE")
-          print("✓ wheel 结构正确:", wheels[0])
-          PY
+        run: python scripts/check_wheel.py
 
   # 子目录模块的 tag 必须带目录前缀（local-ai-runtime-sdk/go/v0.1.0）。
   #

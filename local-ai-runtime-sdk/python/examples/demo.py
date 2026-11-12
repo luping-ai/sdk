@@ -48,20 +48,55 @@ import threading
 import time
 from typing import Callable
 
-from localai import (
-    APIError,
-    ChatRequest,
-    Client,
-    Config,
-    DiscoveryPath,
-    ImportRequest,
-    Message,
-    SearchRequest,
-    StreamEventType,
-    Timeouts,
-    is_retryable,
-    retry_after_of,
-)
+try:
+    from localai import (
+        APIError,
+        ChatRequest,
+        Client,
+        Config,
+        DiscoveryPath,
+        ImportRequest,
+        Message,
+        SearchRequest,
+        StreamEventType,
+        Timeouts,
+        is_retryable,
+        retry_after_of,
+    )
+except ModuleNotFoundError as exc:
+    # 直接给可操作的提示，而不是丢一句 "No module named 'localai'"。
+    # 这个错误在实际使用中非常常见，且原因分好几种，光看报错无法判断：
+    #   1. 没装包
+    #   2. 装了但用的是另一个 Python（系统装了多个解释器很常见）
+    #   3. 项目里有 .venv 但没激活——此时 PATH 里的 python 是全局的
+    print()
+    print("找不到 localai 模块。可能的原因与做法：", file=sys.stderr)
+    print()
+    print("  1) 还没安装：", file=sys.stderr)
+    print("       pip install luping-localai", file=sys.stderr)
+    print()
+    print("  2) 装了但用错了 Python 解释器", file=sys.stderr)
+    print(f"       当前解释器：{sys.executable}", file=sys.stderr)
+    print("       确认 pip 与 python 来自同一个 Python：", file=sys.stderr)
+    print("       python -m pip install luping-localai", file=sys.stderr)
+    print()
+    print("  3) 项目里有 .venv 但没激活", file=sys.stderr)
+    print("       .venv\\Scripts\\activate        （Windows）", file=sys.stderr)
+    print("       source .venv/bin/activate    （Linux / macOS）", file=sys.stderr)
+    print("     或直接用 venv 内的解释器运行：", file=sys.stderr)
+    print("       .venv\\Scripts\\python examples\\demo.py", file=sys.stderr)
+    print()
+    print("  4) Windows 上 python 指向应用商店占位符（0 字节）", file=sys.stderr)
+    print("       症状：敲 python 毫无反应、退出码 9009", file=sys.stderr)
+    print("       验证：Get-Command python", file=sys.stderr)
+    print("       若路径含 Microsoft\\WindowsApps，改用 py 或完整路径：",
+          file=sys.stderr)
+    print("       py examples\\demo.py", file=sys.stderr)
+    print()
+    if exc.name and exc.name != "localai":
+        print(f"  （真正缺失的是 {exc.name}，不是 localai 本身）",
+              file=sys.stderr)
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # 输出辅助

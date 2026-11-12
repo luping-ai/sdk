@@ -104,6 +104,27 @@ jobs:
       - name: mypy
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         run: mypy localai
+
+      # 环境检查脚本本身也要能跑——它是用户排障的第一入口，
+      # 挂了比没有更糟。CI 里 Runtime 不在线，所以它应报 Runtime 那一项
+      # 并退出 1；这里只验证它能正常执行到汇总（不崩）。
+      - name: 环境检查脚本可运行
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set +e
+          python scripts/check_env.py > env.txt 2>&1
+          cat env.txt
+          if grep -q "Traceback" env.txt; then
+            echo "::error::check_env.py 抛了 traceback"
+            exit 1
+          fi
+          if ! grep -q "环境检查" env.txt; then
+            echo "::error::check_env.py 没有输出预期内容"
+            exit 1
+          fi
+          echo "✓ check_env.py 可正常运行"
+
       # 关键：不设 LAIH_E2E，test_live.py 应全部跳过而不是失败。
       - name: pytest
         run: pytest -v

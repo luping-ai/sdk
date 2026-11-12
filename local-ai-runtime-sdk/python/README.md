@@ -33,6 +33,53 @@ print(res.content)
 python examples/demo.py
 ```
 
+### 先确认环境（30 秒）
+
+跑不通时通常不是代码问题，而是解释器选错了。一条命令诊断：
+
+```bash
+python scripts/check_env.py       # 若 python 不可用，改用:
+py scripts/check_env.py           # Windows 启动器
+.venv\Scripts\python scripts/check_env.py   # venv 内的解释器
+```
+
+它会检查 Python 版本、`python` 命令是否指向真的解释器、包能否导入、
+Runtime 是否在线，并对每个问题给出修复步骤。
+
+> **Windows 上 `python` 可能是个空壳**
+>
+> 如果你敲 `python examples/demo.py` 后**什么都没打印、退出码 9009**，
+> 那么 `python` 指向的是 Windows 应用商店的占位符（0 字节），
+> 而不是真正的 Python。验证：
+>
+> ```powershell
+> Get-Command python
+> # 路径含 Microsoft\WindowsApps 就是它
+> ```
+>
+> 三种处理方式（任选）：
+>
+> ```powershell
+> py examples\demo.py                        # 1. 用 py 启动器
+> .venv\Scripts\python examples\demo.py      # 2. 用 venv 内的解释器
+> ```
+>
+> ```
+> 3. 设置 → 应用 → 高级应用设置 → 应用执行别名，
+>    关闭 python.exe 与 python3.exe，再从 PATH 里去掉 WindowsApps
+> ```
+>
+> 这种情况**连 Python 代码都执行不到**，所以 demo 自己没法提示你——
+> 只能靠 `check_env.py` 或本文档。
+
+### 三种跑法
+
+| 场景 | 命令 |
+| --- | --- |
+| 项目里已建 `.venv` | `.venv\Scripts\python examples\demo.py`（Windows）<br>`./.venv/bin/python examples/demo.py`（Linux/macOS） |
+| 已激活 venv | `python examples/demo.py` |
+| 只装了 PyPI 包 | `python demo.py`（在 demo.py 所在目录） |
+
 它会列出 10 项功能，输入编号单独运行：
 
 ```

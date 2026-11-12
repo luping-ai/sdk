@@ -25,6 +25,47 @@ print(res.content)
 
 ---
 
+## 零、先跑演示看效果
+
+装好、Runtime 也启动后，不必读文档——直接跑演示：
+
+```bash
+python examples/demo.py
+```
+
+它会列出 10 项功能，输入编号单独运行：
+
+```
+ 1. 连接与发现（不写死端口）
+ 2. 这台机器能做什么（能力分级）
+ 3. 模型清单与加载状态
+ 4. 对话（非流式、多轮、可复现）
+ 5. 结构化输出（json_schema 约束解码）
+ 6. 流式对话（SSE、提前中断）
+ 7. 知识库全流程（建库→导入→检索→RAG→清理）
+ 8. 错误处理（12 种可判定类别）
+ 9. 三层超时（实测触发）
+10. 并发调用（线程共享 Client）
+```
+
+也可以直接指定某一项，或全部跑一遍：
+
+```bash
+python examples/demo.py chat      # 只看对话
+python examples/demo.py kb        # 只看知识库
+python examples/demo.py all       # 全部
+
+python examples/demo.py --list    # 只列编号，不连 Runtime
+```
+
+> 演示是**从 PyPI 装的那个包**跑起来的，不需要源码目录——
+> 把 `examples/demo.py` 拷到任何地方都能用。
+>
+> 每项独立：某一项因本机能力不足（如没启用 RAG）会跳过并说明原因，
+> 不影响其他项。
+
+---
+
 ## 一、它不做什么
 
 先明确边界，避免误用：
@@ -256,6 +297,63 @@ finally:
 
 单帧解析失败**不中断整条流**——继续读后续内容，用户至少能看到部分
 输出。
+
+---
+
+## 七之二、结构化输出（约束解码）
+
+传 `json_schema` 启用约束解码：模型在生成时只能产出符合 schema 的
+token，而不是"生成完再校验、不合格就重试"。后者在本地小模型上几乎
+必然反复失败。
+
+```python
+schema = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "maxLength": 40},
+        "confidence": {"type": "number"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 20},
+            "maxItems": 4,
+        },
+    },
+    "required": ["intent", "confidence", "keywords"],
+}
+
+res = client.chat(ChatRequest(
+    messages=[Message("user", "把这个月的销售订单导出成 Excel")],
+    json_schema=schema,
+    max_tokens=300,
+    temperature=0.0,
+))
+
+data = json.loads(res.content)     # 不需要 try/except 兜底
+```
+
+> ### ⚠ 数组和字符串必须写上限
+>
+> 约束解码能阻止模型输出 schema 之外的内容，但**挡不住它无限重复
+> 合法内容**。
+>
+> 实测（qwen2.5-1.5b Q4，本机）：schema 里 `keywords` 数组不设
+> `maxItems` 时，模型把 `"automation tool"` 重复几十遍，一直撞到
+> `max_tokens` 上限被截断——21.8 秒、1562 字符、JSON 在字符串中间
+> 断掉、解析失败。复测三次完全一致，说明是稳定复现而非偶发。
+>
+> 加上 `maxItems: 4` 后：**2.8 秒返回、`finish_reason=stop`、JSON 合法**。
+>
+> 把 `max_tokens` 当作防重复手段是无效的——它只会把输出截断在更难
+> 诊断的位置。**正确的做法是给 schema 加约束**：
+>
+> | 约束 | 作用 |
+> | --- | --- |
+> | `maxItems` | 数组长度上限（最关键） |
+> | `maxLength` | 字符串长度上限 |
+> | `enum` | 用枚举代替自由字符串 |
+>
+> 若解析失败且 `res.truncated` 为真，先怀疑这个；若没截断却失败，
+> 才怀疑引擎未启用约束解码，或 schema 里有不支持的 `oneOf` / `anyOf`。
 
 ---
 

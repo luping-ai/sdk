@@ -99,7 +99,7 @@ jobs:
 
       - name: ruff
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        run: ruff check localai tests scripts
+        run: ruff check localai tests scripts examples
 
       - name: mypy
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
@@ -107,6 +107,35 @@ jobs:
       # 关键：不设 LAIH_E2E，test_live.py 应全部跳过而不是失败。
       - name: pytest
         run: pytest -v
+
+      # 示例编不过/跑不起来等于文档说谎。这里只验证它能启动并正确
+      # 列出功能——真实运行需要 Runtime，CI 里没有。
+      - name: 示例可运行（--list）
+        run: python examples/demo.py --list
+
+      # 无 Runtime 时示例必须给出可操作的提示并以非零退出，
+      # 而不是抛 traceback 让用户不知所措。
+      - name: 示例在无 Runtime 时优雅失败
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set +e
+          LAIH_URL=http://127.0.0.1:1 python examples/demo.py chat > out.txt 2>&1
+          code=$?
+          cat out.txt
+          if [ "$code" -eq 0 ]; then
+            echo "::error::Runtime 不可用时示例应以非零退出"
+            exit 1
+          fi
+          if grep -q "Traceback" out.txt; then
+            echo "::error::示例打印了 traceback，应给出可操作的提示"
+            exit 1
+          fi
+          if ! grep -q "localai-cli serve" out.txt; then
+            echo "::error::提示里没有告诉用户怎么启动 Runtime"
+            exit 1
+          fi
+          echo "✓ 无 Runtime 时给出可操作提示，未抛 traceback"
 
       # 零依赖是设计约束，必须在 CI 里守住：一旦有人加了一条
       # dependencies，这里会立刻失败。

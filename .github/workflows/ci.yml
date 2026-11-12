@@ -99,12 +99,11 @@ jobs:
 
       - name: ruff
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        run: ruff check localai tests
+        run: ruff check localai tests scripts
 
       - name: mypy
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         run: mypy localai
-
       # 关键：不设 LAIH_E2E，test_live.py 应全部跳过而不是失败。
       - name: pytest
         run: pytest -v

@@ -62,7 +62,7 @@ def main() -> int:
     pyproject = root / "pyproject.toml"
 
     if not pyproject.is_file():
-        print("找不到 %s" % pyproject, file=sys.stderr)
+        print(f"找不到 {pyproject}", file=sys.stderr)
         return 1
 
     doc = load_pyproject(pyproject)
@@ -74,7 +74,7 @@ def main() -> int:
     deps = project.get("dependencies", [])
     if deps != ALLOWED:
         print("运行时依赖必须为空（零依赖是设计约束）", file=sys.stderr)
-        print("  实际：%s" % (deps,), file=sys.stderr)
+        print(f"  实际：{deps}", file=sys.stderr)
         print("", file=sys.stderr)
         print("  如果你确实需要加依赖，先想清楚代价：SDK 会被大量第三方",
               file=sys.stderr)
@@ -89,24 +89,24 @@ def main() -> int:
     # 顺带确认包能被 setuptools 找到（拼错 packages 会导致 wheel 里没代码）
     packages = doc.get("tool", {}).get("setuptools", {}).get("packages")
     if packages != ["localai"]:
-        print("packages 应为 ['localai']，实际 %s" % (packages,),
+        print(f"packages 应为 ['localai']，实际 {packages}",
               file=sys.stderr)
         return 1
 
     init = root / "localai" / "__init__.py"
     if not init.is_file():
-        print("找不到 %s" % init, file=sys.stderr)
+        print(f"找不到 {init}", file=sys.stderr)
         return 1
 
     # py.typed 缺失时，下游 mypy 不会使用本包的类型注解——静默失效
     pytyped = root / "localai" / "py.typed"
     if not pytyped.is_file():
-        print("找不到 %s（缺它会让下游 mypy 忽略本包类型）" % pytyped,
+        print(f"找不到 {pytyped}（缺它会让下游 mypy 忽略本包类型）",
               file=sys.stderr)
         return 1
 
     print("OK 零运行时依赖")
-    print("OK packages = %s" % (packages,))
+    print(f"OK packages = {packages}")
     print("OK localai/__init__.py 与 py.typed 就位")
     return 0
 

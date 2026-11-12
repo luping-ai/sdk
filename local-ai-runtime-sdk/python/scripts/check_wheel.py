@@ -5,10 +5,10 @@
 
 | 项 | 缺失的后果 |
 | --- | --- |
-| `localai/py.typed` | 下游 mypy **静默忽略**本包的类型注解。用户不会得到任何报错，只是类型检查突然失去作用 |
-| `*.dist-info/licenses/LICENSE` | Apache-2.0 要求随分发附带许可证文本 |
-| 恰好一个 wheel | 多出来通常意味着 dist/ 里有上次构建的残留，会误发旧版本 |
-| 全部源码模块在内 | `[tool.setuptools].packages` 写错时 wheel 里会缺文件，而 import 失败要等用户安装后才发现 |
+| `localai/py.typed` | 下游 mypy **静默忽略**本包类型，用户拿不到报错 |
+| `*.dist-info/licenses/LICENSE` | Apache-2.0 要求随分发附带许可证 |
+| 恰好一个 wheel | 多个通常是残留，会误发旧版本 |
+| 全部源码模块在内 | `packages` 配错时 wheel 缺文件，装完才发现 |
 
 ## 为什么是独立文件
 
@@ -49,10 +49,12 @@ def main() -> int:
         print("dist/ 下没有 wheel，先运行 python -m build --wheel", file=sys.stderr)
         return 1
     if len(wheels) > 1:
-        print("dist/ 下有 %d 个 wheel，无法确定发哪个（多半是残留）："
-              % len(wheels), file=sys.stderr)
+        print(
+            f"dist/ 下有 {len(wheels)} 个 wheel，无法确定发哪个（多半是残留）：",
+            file=sys.stderr,
+        )
         for w in wheels:
-            print("  %s" % w, file=sys.stderr)
+            print(f"  {w}", file=sys.stderr)
         print("清理 dist/ 后重新构建。", file=sys.stderr)
         return 1
 
@@ -66,7 +68,7 @@ def main() -> int:
     if missing:
         print("wheel 缺少模块：", file=sys.stderr)
         for m in missing:
-            print("  %s" % m, file=sys.stderr)
+            print(f"  {m}", file=sys.stderr)
         print("检查 pyproject.toml 的 [tool.setuptools].packages。", file=sys.stderr)
         problems += 1
 
@@ -81,14 +83,14 @@ def main() -> int:
     if junk:
         print("wheel 含构建垃圾：", file=sys.stderr)
         for n in junk[:5]:
-            print("  %s" % n, file=sys.stderr)
+            print(f"  {n}", file=sys.stderr)
         problems += 1
 
     if problems:
         return 1
 
-    print("OK wheel 结构正确：%s" % Path(wheel).name)
-    print("OK %d 个模块，含 py.typed 与 LICENSE" % len(REQUIRED_MODULES))
+    print(f"OK wheel 结构正确：{Path(wheel).name}")
+    print(f"OK {len(REQUIRED_MODULES)} 个模块，含 py.typed 与 LICENSE")
     return 0
 
 

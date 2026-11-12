@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/luping-ai/local-ai-sdk-go/localai"
+	"github.com/luping-ai/sdk/local-ai-runtime-sdk/go/localai"
 )
 
 func main() {

@@ -3,11 +3,14 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["v*", "*/v*"]
   pull_request:
 
+# 这个仓库是 monorepo：未来会有 local-ai-runtime-sdk/python/、其他产品的
+# SDK 等等。CI 按目录路径过滤，改一个语言不跑另一个语言的测试。
 jobs:
-  test:
+  go:
+    name: Go (local-ai-runtime-sdk/go)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -16,16 +19,22 @@ jobs:
         # 所以三个平台都跑测试，避免只在 CI 的 Linux 上通过而 Windows 用户跑不起来。
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: ["1.27.x"]
+    defaults:
+      run:
+        # 子目录模块：所有命令都在这里跑。
+        working-directory: local-ai-runtime-sdk/go
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+          cache-dependency-path: local-ai-runtime-sdk/go/go.mod
 
       # gofmt 不一致会让下游 diff 里混入无关格式改动，直接在 CI 拦掉。
       - name: gofmt
         if: matrix.os == 'ubuntu-latest'
+        shell: bash
         run: |
           diff=$(gofmt -l .)
           if [ -n "$diff" ]; then
@@ -41,11 +50,56 @@ jobs:
         run: go test ./...
 
   # 编译检查示例：示例编不过等于文档说谎。
-  build-examples:
+  go-examples:
+    name: Go examples build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: local-ai-runtime-sdk/go
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache-dependency-path: local-ai-runtime-sdk/go/go.mod
       - run: go build ./examples/...
+
+  # 子目录模块的 tag 必须带目录前缀（local-ai-runtime-sdk/go/v0.1.0）。
+  #
+  # 裸 tag（v0.1.0）不会让 go get 报"tag 写错了"，而是报一句极具误导性的
+  # "module found, but does not contain package ..."。打错了几乎没人能自己
+  # 诊断出来。所以在发布环节就拦掉，而不是等下游踩。
+  tag-format:
+    name: Tag 格式
+    runs-on: ubuntu-latest
+    # 只在推送 tag 时跑（分支推送与 PR 没有 tag 语义）
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: 检查 tag 是否带模块目录前缀
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+
+          # 裸版本号（v1.2.3 / v1.2.3-rc.1）意味着"仓库根是 Go 模块"，
+          # 但本仓库根没有 go.mod。这种 tag 一定对应某个子目录模块被漏写了前缀。
+          if [[ "$tag" =~ ^v[0-9] ]]; then
+            echo "::error::tag '$tag' 缺少模块目录前缀。"
+            echo ""
+            echo "本仓库是多模块 monorepo，Go 模块在子目录里，tag 必须写成："
+            echo "  local-ai-runtime-sdk/go/v1.2.3"
+            echo ""
+            echo "裸 tag 会让下游 go get 报 'does not contain package'，"
+            echo "而不是提示你 tag 写错了。"
+            exit 1
+          fi
+
+          # 带前缀的 tag：确认对应目录里真有 go.mod，避免拼错目录名。
+          moddir="${tag%/v*}"
+          if [ ! -f "$moddir/go.mod" ]; then
+            echo "::error::tag '$tag' 指向的目录 '$moddir' 里没有 go.mod。"
+            echo "现有 Go 模块目录："
+            find . -name go.mod -not -path './.git/*' | sed 's|/go.mod$||' | sed 's|^\./|  |'
+            exit 1
+          fi
+
+          echo "✓ tag '$tag' 格式正确（模块目录 $moddir）"

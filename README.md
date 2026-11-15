@@ -86,28 +86,41 @@ other-product-sdk/go/v1.0.0
 其它语言不受这条规则约束：Python 发到 PyPI、npm 发到 registry 之后，
 仓库布局对使用者完全不可见，tag 只用于标记发布点。
 
-### Python 发版（不走 tag 规则）
+### Python 发版
 
 ```bash
 cd local-ai-runtime-sdk/python
 
-# 1. 改 pyproject.toml 的 version，并把 README 的"已知限制"核对一遍
+# 1. 改 pyproject.toml 的 version（同时改 localai/__init__.py 的 __version__）
+#    并核对 README 的"已知限制"一节
 # 2. 本地验证
-pytest && ruff check localai tests && mypy localai
+pytest && ruff check localai tests scripts examples && mypy localai
 python -m build --wheel --outdir dist
+python scripts/check_wheel.py
 
 # 3. 发布（需要 PyPI 凭证）
 twine upload dist/*
 ```
 
-打一个纯标记 tag（格式任意，CI 的 `tag-format` 只拦裸 `v*`）：
+#### tag 格式：前缀必须是**真实存在的目录**
 
 ```bash
-git tag python/v0.1.0
+git tag -a local-ai-runtime-sdk/python/v0.2.0 -m "Python SDK v0.2.0"
+git push origin local-ai-runtime-sdk/python/v0.2.0
 ```
 
-> **不要**打 `v0.1.0` 这种裸 tag——CI 会拦（它意味着"仓库根是 Go 模块"，
-> 而本仓库根没有 `go.mod`）。
+CI 的 `Tag 格式` job 会校验两件事：
+
+1. 不能是裸 `v*`——那意味着"仓库根是 Go 模块"，而本仓库根没有 `go.mod`。
+   下游 `go get` 会得到 `does not contain package` 而不是"tag 写错了"。
+2. **前缀必须是仓库里真实存在的目录**。`python/v0.2.0` 会被拒绝，因为
+   本仓库没有顶层 `python/` 目录（真实路径是 `local-ai-runtime-sdk/python`）。
+
+这条规则对 Go 模块是硬要求（`go get` 靠它定位子模块），对 Python 只是
+标记发布点——但 CI 用的是同一套检查，所以格式要一致。
+
+> 曾经 README 这里写 `git tag python/v0.1.0`，是错的：CI 会拦。
+> 2026-11-15 修正为完整目录前缀。
 
 ## 本地开发
 

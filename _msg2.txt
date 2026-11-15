@@ -1,0 +1,39 @@
+chore(python): 版本提到 0.2.0，README 重写知识库章节
+
+## 为什么提 minor 而不是 patch
+
+0.1.0 到 0.2.0 含**破坏性变更**：
+
+- `import_document` / `upload_document` 的服务端端点已移除，调用得到 404。
+  替代品是 `ingest_chunks`，API 形态完全不同（传已切好的块，不是路径）。
+- `KnowledgeSource` / `SearchHit` 加字段（向后兼容）。
+- `KBIDs` 的语义扩展（`ALL_BASES`）。
+
+按 semver，破坏性变更必须提 minor（0.x 阶段 minor 承载破坏性变更）。
+
+## README 第八章重写
+
+原内容是"传路径让 Runtime 解析"，已不是主路径。新内容：
+
+- `ingest_chunks` 作为主示例，含 `ChunkerInfo` 与 `ChunkInput` 的用法
+- **为什么是 ingest_chunks 而不是传路径**：格式覆盖率 70%→接近 100%、
+  页码溯源、标题路径。这三条是这次改造的全部动机，写清楚才不会有人
+  问"为什么要多写这些解析代码"
+- `chunker.version` 必须随算法变化 + 409 的处理方式（**不要重试**，
+  正确动作是重建索引）
+- 分页上限（2000 块 / 20 MB）与分批提交方式
+- `import_document` / `upload_document` 标注已废弃
+- `ALL_BASES` 全库检索的三种写法与规则表
+- 相似检测三个方法（`dedup_check` / `dedup_groups` / `dedup_diff`），
+  含"结果不完整时要看 pending / stale"这条容易漏的
+- `page_start = 0` 表示未知，**不要显示成"第 0 页"**
+
+## 验证
+
+- `ruff check localai tests scripts examples` 全通过
+- `mypy localai` 无问题
+- `pytest` 122 通过，7 skipped
+- `python -m build` 产出 `luping_localai-0.2.0-py3-none-any.whl`
+- `scripts/check_wheel.py` 结构校验通过（8 个模块 + py.typed + LICENSE）
+- **干净 venv 安装 wheel 后验证**：`__version__ == "0.2.0"`、
+  `ALL_BASES`、`dedup_check`、`ingest_chunks` 均可用

@@ -1,6 +1,6 @@
 [project]
 name = "luping-localai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local AI Hub Runtime 的官方 Python 客户端（零依赖）"
 readme = "README.md"
 requires-python = ">=3.9"

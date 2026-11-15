@@ -430,25 +430,40 @@ data = json.loads(res.content)     # 不需要 try/except 兜底
 ## 八、知识库（RAG）
 
 ```python
-from localai import ImportRequest, SearchRequest, ChatRequest, Message
+from localai import (
+    ChatRequest, ChunkInput, ChunkerInfo, IngestChunksRequest,
+    Message, SearchRequest,
+)
 
 kb = client.create_kb("售后库", description="客服话术与常见问题")
 
-# 导入（传路径，Runtime 直接读盘——比传文件内容省内存）
-r = client.import_document(kb.id, ImportRequest(path=r"C:\docs\manual.md"))
+# 入库：把**已解析、已切好**的块直接提交
+r = client.ingest_chunks(kb.id, IngestChunksRequest(
+    name="售后服务手册",
+    file_type="pdf",
+    file_hash=sha256_of_file,        # 同库内去重与幂等
+    chunker=ChunkerInfo(name="localkb-py", version="1.0.0",
+                        target_chars=450, max_chars=600, overlap_chars=54),
+    chunks=[
+        ChunkInput(0, "本条款适用于……", page_start=3, page_end=3,
+                   heading_path="第三章 保修 > 3.2 期限"),
+        ChunkInput(1, "保修期为两年。", page_start=4),
+    ],
+))
 print(f"{r.chunk_count} 个切片")
 
-# 内容未变时重复导入不会产生新文档
-r2 = client.import_document(kb.id, ImportRequest(path=r"C:\docs\manual.md"))
+# 内容未变时重复提交不会产生新文档
+r2 = client.ingest_chunks(kb.id, req)
 assert r2.duplicate and r2.existing_id == r.document_id
 
 # 向量化（补齐语义检索；不向量化也能做关键词检索）
 client.vectorize(kb.id)             # 大库用 is_async=True
 
-# 检索
+# 检索：结果带页码与章节
 sr = client.search(SearchRequest(query="怎么退货", kb_ids=[kb.id], top_k=5))
 for h in sr.hits:
-    print(f"{h.score:.3f} {h.text[:50]}")
+    where = f"第 {h.page_start} 页" if h.page_start else "页码未知"
+    print(f"{h.score:.3f} {where} {h.heading_path} | {h.text[:40]}")
 
 # 对话时自动检索并注入
 res = client.chat(ChatRequest(
@@ -457,35 +472,141 @@ res = client.chat(ChatRequest(
 ))
 print(res.content)
 print(f"用了 {res.knowledge.used_chunks} 个切片")
+for s in res.knowledge.sources:
+    print(f"  来源：{s.source} · 第 {s.page_start or '?'} 页 · {s.heading_path}")
 ```
 
-支持 `.txt` / `.md` / `.pdf` / `.docx` / `.xlsx`。
+### 为什么是 `ingest_chunks` 而不是传路径
 
-### 上传文件内容（GUI / Web 场景）
+**Runtime 不再解析文档、不再切块。** 解析与切块交给客户端（PyMuPDF /
+python-docx / openpyxl / python-pptx），Runtime 只负责落库、建索引、
+算向量、检索与拼接。
 
-用户选中的文件在应用进程里，没有"Runtime 能直接读的路径"这个概念
-（尤其应用跑在容器、远程桌面或沙箱里时）：
+换来的是：
+
+- **格式覆盖率**：从约 70% 接近 100%。Go 侧没有可用的纯 OCR 实现
+  （引 CGO 违反设计约束），也不支持 `.pptx`；客户端侧这些都是一行调用。
+- **页码溯源**：客户端解析时就知道块来自第几页，Runtime 只存字段。
+- **标题路径**：`[第三章 保修 > 3.2 期限]` 这段前缀参与向量化，
+  问"保修期限"才能命中——Go 的解析器在解析阶段就把样式信息丢了。
+
+### `chunker.version` 必须随算法变化
+
+它标识**切块算法**，不只是参数。参数相同但算法改了（如句末判定逻辑
+变化）时，参数无法表达"这不是同一种切法"。新旧两种切法的块混在同一个
+库里，用户点来源时页码对不上、检索分数也不可比。
+
+版本与库内不一致时服务端返回 409 → SDK 抛 `ErrChunkerMismatch`：
 
 ```python
-r = client.upload_document(kb.id, "manual.pdf", open("manual.pdf", "rb").read())
+from localai import APIError, ErrChunkerMismatch
+
+try:
+    client.ingest_chunks(kb.id, req)
+except APIError as e:
+    if e.kind is ErrChunkerMismatch:
+        # 不要重试——重试必然再失败。正确动作是重建该库索引：
+        for d in client.list_documents(kb.id):
+            client.delete_document(kb.id, d.id)
+        # 然后重新 ingest_chunks 全部文档
 ```
 
-`filename` **必须带扩展名**——服务端按扩展名选解析器，传 `"data"`
-会被拒绝。
+`is_retryable(ErrChunkerMismatch)` 恒为 False，SDK 的内部重试也不会
+针对它重试。
 
-### `import_document` 与 `upload_document` 的选择
+### 分页与上限
 
-| | `import_document` | `upload_document` |
-| --- | --- | --- |
-| 传什么 | 路径 | 文件内容 |
-| 适用 | CLI、本机脚本 | GUI、Web、容器 |
-| 存储模式 | 可选 MANAGED / EXTERNAL | 恒为 MANAGED |
+单个请求最多 2000 块、总文本 20 MB。更长的文档应分批提交（`ordinal`
+连续，靠 `update_document_id` 续接）。
+
+### `import_document` / `upload_document` 已废弃
+
+它们的服务端端点已从契约移除，**调用会得到 404**。保留在 SDK 里只为
+让错误信息可读（`404` 比 `AttributeError` 更有指导性），不要在新代码
+里使用。
+
+### 全库检索：`ALL_BASES`
+
+```python
+from localai import ALL_BASES
+
+# 在全部知识库里查（显式声明）
+sr = client.search(SearchRequest(query="退货政策", kb_ids=[ALL_BASES]))
+assert sr.all_bases and sr.base_count == 3   # 实际检索了几个库
+```
+
+规则：
+
+| `kb_ids` | 行为 |
+| --- | --- |
+| `["kb_1", "kb_2"]` | 只查这些，最多 30 个 |
+| `[ALL_BASES]` | 该实例全部知识库；展开后超过 50 个会报错 |
+| 省略 / `[]` | **报错**，不会退化为全库 |
+
+`ALL_BASES` 与具体 ID 混用是错误（`[ALL_BASES, "kb_1"]` 返回 400）——
+混用有歧义，服务端不做"或"的猜测。
+
+**对话路径的差异**：`ChatRequest.kb_ids` 为空是**合法**的（普通对话），
+与 `search` 不同。
+
+### 相似检测
+
+判断库里哪几份文档其实是同一份东西（同一文件的多个版本、同模板的
+月度报表）：
+
+```python
+# 检查全库
+res = client.dedup_check(kb.id)
+for g in res.groups:
+    print(g.summary())      # "similar 组（3 份，最大距离 2）：合同.pdf / 合同(1).pdf / ..."
+
+# 只看有没有漏检：pending 非空说明结果不完整
+if res.pending:
+    print(f"还有 {len(res.pending)} 份没参与检测（指纹未算）")
+    res = client.dedup_check(kb.id, DedupCheckRequest(recompute=True))
+
+# 页面加载时读上次结果（不重算）
+r = client.dedup_groups(kb.id)
+if r.stale:
+    print(f"结果不完整：{r.pending_count} 份新文档还没参与检测")
+
+# 两份文档逐块对比
+d = client.dedup_diff(kb.id, doc_a="doc_1", doc_b="doc_2")
+print(f"新增 {len(d.added)} 段，删除 {len(d.removed)} 段，改动 {len(d.changed)} 段")
+```
+
+三个方法都是**只读**：检测只告诉你哪几份看起来是同一份，不替你做决定。
+"保留哪一份"通过已有方法表达：
+
+```python
+client.delete_document(kb.id, b.id)     # 删掉不要的那份
+client.ingest_chunks(kb.id, better_req) # 或补上更好的那份
+```
+
+大库首次检测可能十几秒，用后台模式（P3 优先级，不会与提问抢 CPU）：
+
+```python
+res = client.dedup_check(kb.id, DedupCheckRequest(async_=True))
+task = client.task(res.task_id)          # 轮询进度
+```
 
 ### RAG 上下文里一个容易忽略的字段
 
 `RAGContext.fixed_overhead_tokens` 是防注入声明 + 标题 + 指令占用的
 token，**预算再小也省不掉**。若 `context_tokens` 设得比它小，一条资料
 都放不进去（表现为 `used_chunks` 恒为 0）。所以别把预算设得太紧。
+
+### `page_start = 0` 表示"未知"
+
+旧数据（解析下沉之前入库的）或客户端没提供时，`page_start` 是 0。
+**不要显示成"第 0 页"**——那是个不存在的位置。判断方式：
+
+```python
+if h.page_start > 0:
+    label = f"第 {h.page_start} 页"
+else:
+    label = "页码未知"
+```
 
 ---
 

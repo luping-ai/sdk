@@ -14,3 +14,19 @@ coverage.html
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Python 虚拟环境与缓存
+#
+# .venv 是默认名（python -m venv .venv），.venv2 之类的变体用于
+# "干净环境复现 CI"的场景。不忽略的话 `git status` 会被几千个
+# 文件淹没，而它们完全可以重建。
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/

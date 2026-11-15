@@ -1142,5 +1142,45 @@ def main(argv: list[str]) -> int:
             print("\n  已中断")
 
 
+def _ensure_utf8_stdio() -> None:
+    """把 stdout/stderr 切到 UTF-8，避免非 UTF-8 控制台抛 UnicodeEncodeError。
+
+    ## 为什么必须做
+
+    Windows 控制台默认编码不一定是 UTF-8：
+      · 中文系统常见 cp936（GBK）
+      · 英文系统常见 cp1252
+      · GitHub Actions 的 windows-latest 是 cp1252
+
+    本程序输出全是中文。在 cp1252 终端下 `print("连接与发现")` 会直接抛
+    `UnicodeEncodeError: 'charmap' codec can't encode characters`，
+    表现为"双击运行就闪退"，且错误信息与真实原因（编码）毫无关系。
+
+    这不是理论问题：CI 的 `python examples/demo.py --list` 在三个 Windows
+    版本上全部失败，而 Linux/macOS 都通过——差异就在默认编码。
+
+    ## 为什么用 reconfigure 而不是包一层
+
+    `sys.stdout.reconfigure(encoding="utf-8")` 是 3.7+ 的标准做法，
+    直接改底层 TextIOWrapper 的编码，不改变输出流本身。包一层
+    （如 codecs.getwriter）会与 `contextlib.redirect_stdout` 等
+    工具打架，且 `sys.stdout.isatty()` 之类的检查会失真。
+
+    errors="replace" 是兜底：即便终端仍不支持某些字符，也只会显示
+    占位符而不是崩掉——"能看到大半内容"远好于"什么都看不到"。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        # 某些环境（如被 pytest 捕获、或被重定向到 StringIO）下
+        # 没有 reconfigure，跳过即可
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            # ValueError: 流已关闭
+            # OSError: 底层 fd 不支持改编码（极少见）
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 if __name__ == "__main__":
+    _ensure_utf8_stdio()
     sys.exit(main(sys.argv[1:]))

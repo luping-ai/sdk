@@ -30,6 +30,8 @@ import platform
 import shutil
 import sys
 
+from _utf8_stdio import ensure_utf8_stdio
+
 
 def line(label: str, value: object) -> None:
     print(f"  {label:<22}{value}")
@@ -179,4 +181,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     sys.exit(main())

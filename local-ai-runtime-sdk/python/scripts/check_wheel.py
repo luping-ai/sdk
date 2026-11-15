@@ -28,6 +28,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+from _utf8_stdio import ensure_utf8_stdio
+
 # 必须出现在 wheel 里的模块（与 localai/ 下的实际文件对应）
 REQUIRED_MODULES = [
     "localai/__init__.py",
@@ -95,4 +97,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     sys.exit(main())

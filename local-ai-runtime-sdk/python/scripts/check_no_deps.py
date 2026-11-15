@@ -37,6 +37,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from _utf8_stdio import ensure_utf8_stdio
+
 ALLOWED: list = []
 
 
@@ -112,4 +114,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     sys.exit(main())

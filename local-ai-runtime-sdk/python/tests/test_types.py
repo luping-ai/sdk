@@ -18,14 +18,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fakeruntime import FakeRuntime, envelope, error
 
 from localai import (
+    ALL_BASES,
+    APIError,
     ChatRequest,
+    ChunkerInfo,
+    ChunkInput,
     Client,
     Config,
+    DedupCheckRequest,
+    DupGroup,
+    DupMember,
+    ErrChunkerMismatch,
     ErrInvalidRequest,
     ErrNotFound,
     ImportRequest,
+    IngestChunksRequest,
     Message,
     SearchRequest,
+    is_retryable,
 )
 from localai._client import _multipart, _seg
 from localai._types import (
@@ -518,6 +528,70 @@ def test_search_parsing():
     assert sr.context is None
 
 
+def test_search_all_bases():
+    """ALL_BASES 展开：响应要带 all_bases / base_count，
+    且请求体里传的就是字面 "all"（不是让 SDK 自己展开）。"""
+    captured = {}
+
+    def handler(r):
+        captured["body"] = json.loads(r["body"])
+        return envelope({
+            "query": "q", "mode": "hybrid", "degraded": False,
+            "results": [],
+            "all_bases": True, "base_count": 3,
+            "total_ms": 40,
+        })
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/search", handler)
+        sr = _client(rt).search(
+            SearchRequest(query="q", kb_ids=[ALL_BASES]))
+
+    # 展开是服务端的事：SDK 只传 "all"，不自己列库。
+    # 若 SDK 擅自展开，客户端与服务端看到的库集合可能不一致。
+    assert captured["body"]["kb_ids"] == ["all"]
+    assert sr.all_bases is True
+    assert sr.base_count == 3
+
+
+def test_search_all_bases_defaults_when_absent():
+    """普通检索的响应里没有这两个字段时，默认值不能是"全库"。"""
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/search", lambda r: envelope({
+            "query": "q", "mode": "hybrid", "results": [],
+        }))
+        sr = _client(rt).search(SearchRequest(query="q", kb_ids=["k"]))
+
+    assert sr.all_bases is False
+    assert sr.base_count == 0
+
+
+def test_knowledge_info_all_bases():
+    """对话路径的 knowledge 信息也要带 all_bases / base_count，
+    且 kb_ids 已展开为具体 ID（不残留 "all"）。"""
+    with FakeRuntime() as rt:
+        # knowledge 在信封顶层（与 model / usage 同级），不在 data 里
+        rt.on("POST", "/api/v1/chat", lambda r: envelope(
+            {"content": "回答", "finish_reason": "stop", "truncated": False},
+            knowledge={
+                "kb_ids": ["kb1", "kb2", "kb3"],
+                "all_bases": True, "base_count": 3,
+                "used_chunks": 2, "context_tokens": 300,
+                "retrieval_ms": 25, "sources": [],
+            },
+            model={"id": "m1"},
+            usage={},
+        ))
+        res = _client(rt).chat(ChatRequest(
+            messages=[Message("user", "问题")], kb_ids=[ALL_BASES]))
+
+    assert res.knowledge is not None
+    assert res.knowledge.all_bases is True
+    assert res.knowledge.base_count == 3
+    assert res.knowledge.kb_ids == ["kb1", "kb2", "kb3"]
+    assert "all" not in res.knowledge.kb_ids
+
+
 def test_search_with_context():
     with FakeRuntime() as rt:
         rt.on("POST", "/api/v1/search", lambda r: envelope({
@@ -597,3 +671,392 @@ def test_upload_translates_not_found():
         with pytest.raises(Exception) as ei:
             _client(rt).upload_document("k", "a.txt", b"x")
         assert ei.value.kind is ErrNotFound
+
+# ---------------------------------------------------------------------------
+# 入库已切好的块（ingest_chunks）
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_chunks_sends_contract_fields():
+    """请求必须打新端点，字段名与契约一致。"""
+    captured = {}
+
+    def handler(r):
+        captured["path"] = r["path"]
+        captured["body"] = json.loads(r["body"])
+        return envelope({
+            "document_id": "d1", "chunk_count": 2,
+            "content_runes": 120, "duplicate": False,
+        })
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks", handler)
+        res = _client(rt).ingest_chunks("kb1", IngestChunksRequest(
+            name="售後手册",
+            file_type="pdf",
+            file_hash="h1",
+            file_size=1234,
+            modified_at=1763000000,
+            source_label="D:/工作/售后手册.pdf",
+            chunker=ChunkerInfo("localkb-py", "1.0.0",
+                                target_chars=450, max_chars=600,
+                                overlap_chars=54),
+            chunks=[
+                ChunkInput(0, "本条款适用于……", page_start=3, page_end=3,
+                           start_rune=1200, rune_count=480,
+                           heading_path="第三章 > 3.2", chunk_type="heading"),
+                ChunkInput(1, "保修期为两年。", page_start=4),
+            ],
+        ))
+
+    assert res.chunk_count == 2
+    assert captured["path"].endswith("/documents/chunks")
+    body = captured["body"]
+    assert body["name"] == "售後手册"
+    assert body["file_hash"] == "h1"
+    assert body["file_type"] == "pdf"
+    assert body["source_label"] == "D:/工作/售后手册.pdf"
+    assert body["chunker"]["name"] == "localkb-py"
+    assert body["chunker"]["version"] == "1.0.0"
+    assert body["chunker"]["target_chars"] == 450
+
+    first = body["chunks"][0]
+    # 溯源字段写错 tag 不会报错，只会在服务端静默变成 0
+    assert first["page_start"] == 3
+    assert first["page_end"] == 3
+    assert first["heading_path"] == "第三章 > 3.2"
+    assert first["chunk_type"] == "heading"
+    assert first["start_rune"] == 1200
+
+
+def test_ingest_chunks_omits_empty_provenance():
+    """未知的溯源字段不发（0/空是"我不知道"，与省略等价）。
+
+    少发几个键让请求体更小、日志更清晰，也避免服务端误以为
+    我们真的提供了"第 0 页"。
+    """
+    captured = {}
+
+    def handler(r):
+        captured["body"] = json.loads(r["body"])
+        return envelope({"document_id": "d1", "chunk_count": 1})
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks", handler)
+        _client(rt).ingest_chunks("kb1", IngestChunksRequest(
+            name="a", file_hash="h",
+            chunker=ChunkerInfo("c", "1"),
+            chunks=[ChunkInput(0, "x")],
+        ))
+
+    chunk = captured["body"]["chunks"][0]
+    assert "page_start" not in chunk
+    assert "heading_path" not in chunk
+    assert set(chunk.keys()) == {"ordinal", "text"}
+
+
+def test_ingest_chunks_validation_local():
+    """本地预检：明显错误的请求不该浪费一次往返。"""
+    called = []
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks",
+              lambda r: called.append(1) or envelope({}))
+        client = _client(rt)
+
+        bad_cases = [
+            ("", IngestChunksRequest(name="a", file_hash="h",
+                                     chunker=ChunkerInfo("c", "1"),
+                                     chunks=[ChunkInput(0, "x")])),
+            ("kb1", IngestChunksRequest(name="", file_hash="h",
+                                        chunker=ChunkerInfo("c", "1"),
+                                        chunks=[ChunkInput(0, "x")])),
+            ("kb1", IngestChunksRequest(name="a", file_hash="",
+                                        chunker=ChunkerInfo("c", "1"),
+                                        chunks=[ChunkInput(0, "x")])),
+            ("kb1", IngestChunksRequest(name="a", file_hash="h",
+                                        chunker=None,
+                                        chunks=[ChunkInput(0, "x")])),
+            ("kb1", IngestChunksRequest(name="a", file_hash="h",
+                                        chunker=ChunkerInfo("c", ""),
+                                        chunks=[ChunkInput(0, "x")])),
+            ("kb1", IngestChunksRequest(name="a", file_hash="h",
+                                        chunker=ChunkerInfo("c", "1"),
+                                        chunks=[])),
+        ]
+        for kb_id, req in bad_cases:
+            with pytest.raises(APIError) as ei:
+                client.ingest_chunks(kb_id, req)
+            assert ei.value.kind is ErrInvalidRequest
+
+    assert not called, "本地预检失败的请求不应发出"
+
+
+def test_ingest_chunks_chunker_mismatch_not_retryable():
+    """409 chunker_mismatch 映射到专用 kind 且不可重试。
+
+    这是最关键的一条：重试必然再失败，只会浪费用户时间。
+    正确动作是重建索引——完全不同的操作。
+    """
+    attempts = []
+
+    def handler(r):
+        attempts.append(1)
+        # error() 已经返回 (status, headers, body_bytes) 三元组，
+        # 不要再 json.dumps 一层——那会把 bytes 当对象序列化
+        return error(409, "chunker_mismatch",
+                     "库内为 localkb-py@1.0.0，本次为 2.0.0，需要重建索引")
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks", handler)
+        client = _client(rt)
+        with pytest.raises(APIError) as ei:
+            client.ingest_chunks("kb1", IngestChunksRequest(
+                name="a", file_hash="h",
+                chunker=ChunkerInfo("c", "2.0.0"),
+                chunks=[ChunkInput(0, "x")],
+            ))
+
+    err = ei.value
+    assert err.kind is ErrChunkerMismatch
+    assert not is_retryable(err)
+    assert len(attempts) == 1, "SDK 不应自动重试 chunker_mismatch"
+    # 错误文案里要有"重建"，否则用户不知道下一步做什么
+    assert "重建" in err.message
+
+
+def test_search_hit_provenance_fields():
+    """SearchHit 的溯源字段要能解析出来。"""
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/search", lambda r: envelope({
+            "query": "q", "mode": "hybrid",
+            "results": [{
+                "chunk_id": "c1", "document_id": "d1", "kb_id": "k",
+                "ordinal": 0, "text": "内容", "score": 0.9,
+                "page_start": 3, "page_end": 5,
+                "heading_path": "第三章 > 3.2", "chunk_type": "table",
+            }],
+        }))
+        sr = _client(rt).search(SearchRequest(query="q", kb_ids=["k"]))
+
+    hit = sr.hits[0]
+    assert hit.page_start == 3
+    assert hit.page_end == 5
+    assert hit.heading_path == "第三章 > 3.2"
+    assert hit.chunk_type == "table"
+
+
+def test_knowledge_source_provenance_fields():
+    """KnowledgeSource（对话路径的引用来源）也要带溯源字段。"""
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/chat", lambda r: envelope(
+            {"content": "答", "finish_reason": "stop", "truncated": False},
+            knowledge={
+                "kb_ids": ["k"], "used_chunks": 1,
+                "sources": [{
+                    "index": 1, "chunk_id": "c1", "document_id": "d1",
+                    "source": "a.pdf", "score": 0.9,
+                    "page_start": 7, "page_end": 7,
+                    "heading_path": "第二章",
+                }],
+            },
+            model={"id": "m1"}, usage={},
+        ))
+        res = _client(rt).chat(ChatRequest(
+            messages=[Message("user", "问题")], kb_ids=["k"]))
+
+    src = res.knowledge.sources[0]
+    assert src.page_start == 7
+    assert src.heading_path == "第二章"
+
+# ---------------------------------------------------------------------------
+# 相似检测（Phase 2）
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_check_fast_path():
+    captured = {}
+
+    def handler(r):
+        captured["path"] = r["path"]
+        captured["body"] = json.loads(r["body"] or b"{}")
+        return envelope({
+            "groups": [{
+                "id": "dg1", "kind": "similar", "max_hamming": 3,
+                "members": [
+                    {"document_id": "a", "name": "a.pdf", "hamming": 0},
+                    {"document_id": "b", "name": "b.pdf", "hamming": 3},
+                ],
+            }],
+            "pending": ["c"],
+            "total_ms": 25,
+        })
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/dedup/check", handler)
+        res = _client(rt).dedup_check(
+            "kb1", DedupCheckRequest(doc_ids=["a", "b", "c"]))
+
+    assert captured["path"].endswith("/dedup/check")
+    assert captured["body"]["doc_ids"] == ["a", "b", "c"]
+
+    assert len(res.groups) == 1
+    g = res.groups[0]
+    assert g.kind == "similar"
+    assert g.max_hamming == 3
+    # 第一个必须是代表（hamming 0）
+    assert g.members[0].document_id == "a"
+    assert g.members[0].hamming == 0
+    assert g.members[1].name == "b.pdf"
+
+    # pending 必须能读到——不检查它会把"还没算指纹"误读成"没有重复"
+    assert res.pending == ["c"]
+    assert res.total_ms == 25
+
+
+def test_dedup_check_none_request():
+    """None 等价于"检查全库"，且不发任何字段。"""
+    captured = {}
+
+    def handler(r):
+        captured["body"] = json.loads(r["body"] or b"{}")
+        return envelope({"groups": []})
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/dedup/check", handler)
+        _client(rt).dedup_check("kb1")
+
+    assert captured["body"] == {}
+
+
+def test_dedup_check_validation():
+    with FakeRuntime() as rt:
+        client = _client(rt)
+        with pytest.raises(APIError) as ei:
+            client.dedup_check("")
+        assert ei.value.kind is ErrInvalidRequest
+
+
+def test_dedup_groups():
+    with FakeRuntime() as rt:
+        rt.on("GET", "/api/v1/knowledge/bases/kb1/dedup/groups",
+              lambda r: envelope({
+                  "groups": [{
+                      "id": "dg1", "kind": "exact", "max_hamming": 0,
+                      "members": [
+                          {"document_id": "a", "hamming": 0},
+                          {"document_id": "b", "hamming": 0},
+                      ],
+                  }],
+                  "computed_at": 1763000000,
+                  "stale": True,
+                  "pending_count": 4,
+              }))
+        res = _client(rt).dedup_groups("kb1")
+
+    assert len(res.groups) == 1
+    assert res.groups[0].kind == "exact"
+    assert res.computed_at == 1763000000
+    # stale 是"结果不完整"的信号，必须能读到
+    assert res.stale is True
+    assert res.pending_count == 4
+
+
+def test_dedup_diff():
+    captured = {}
+
+    def handler(r):
+        captured["path"] = r["path"]
+        return envelope({
+            "doc_a": "a", "doc_b": "b",
+            "added": [{"ordinal": 5, "preview": "新增"}],
+            "removed": [{"ordinal": 2, "preview": "删除"}],
+            "changed": [{"ordinal": 1, "before": "旧", "after": "新"}],
+            "unchanged": 7,
+            "truncated": True,
+        })
+
+    with FakeRuntime() as rt:
+        rt.on("GET", "/api/v1/knowledge/bases/kb1/dedup/diff", handler)
+        d = _client(rt).dedup_diff("kb1", "a", "b")
+
+    # 查询参数必须正确带上
+    assert "doc_a=a" in captured["path"]
+    assert "doc_b=b" in captured["path"]
+
+    assert len(d.added) == 1 and d.added[0].ordinal == 5
+    assert d.added[0].preview == "新增"
+    assert len(d.removed) == 1 and d.removed[0].ordinal == 2
+    assert len(d.changed) == 1
+    assert d.changed[0].before == "旧" and d.changed[0].after == "新"
+    assert d.unchanged == 7
+    assert d.truncated is True
+
+
+def test_dedup_diff_validation():
+    with FakeRuntime() as rt:
+        client = _client(rt)
+        for kb, a, b in [
+            ("", "a", "b"),
+            ("kb1", "", "b"),
+            ("kb1", "a", ""),
+            ("kb1", "a", "a"),  # 自己比自己没有信息量
+        ]:
+            with pytest.raises(APIError) as ei:
+                client.dedup_diff(kb, a, b)
+            assert ei.value.kind is ErrInvalidRequest
+
+
+def test_dedup_diff_escapes_query_params():
+    """doc_id 里的特殊字符必须转义，否则会变成额外参数。"""
+    captured = {}
+
+    def handler(r):
+        captured["path"] = r["path"]
+        return envelope({})
+
+    with FakeRuntime() as rt:
+        rt.on("GET", "/api/v1/knowledge/bases/kb1/dedup/diff", handler)
+        _client(rt).dedup_diff("kb1", "a&b=1", "c")
+
+    # 未转义的话会多出一个 b 参数
+    assert "doc_a=a%26b%3D1" in captured["path"]
+
+
+def test_dup_group_summary():
+    """Summary 用于日志与 UI，格式必须稳定可读。"""
+    g = DupGroup(
+        kind="similar", max_hamming=3,
+        members=[DupMember("a", "合同.pdf", 0), DupMember("b", "合同(1).pdf", 3)],
+    )
+    s = g.summary()
+    assert "similar" in s
+    assert "合同.pdf" in s
+    assert "2 份" in s
+
+    # 没有 name 时退回 document_id
+    g2 = DupGroup(kind="exact", members=[DupMember("x")])
+    assert "x" in g2.summary()
+
+def test_dedup_check_async():
+    """async=true 时返回 task_id，且不发 recompute。"""
+    captured = {}
+
+    def handler(r):
+        captured["body"] = json.loads(r["body"] or b"{}")
+        return envelope({
+            "task_id": "task_abc",
+            "status": "queued",
+            "priority": "background",
+            "poll_after": 1000,
+        })
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/dedup/check", handler)
+        res = _client(rt).dedup_check("kb1", DedupCheckRequest(async_=True))
+
+    assert captured["body"]["async"] is True
+    # async 模式下 groups/pending 都为空
+    assert res.task_id == "task_abc"
+    assert res.groups == []
+    assert res.pending == []

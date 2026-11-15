@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -660,6 +661,111 @@ func TestSearch(t *testing.T) {
 	}
 	if len(res.Context.Sources) != 1 || res.Context.Sources[0].Source != "a.md" {
 		t.Errorf("sources 未解析: %+v", res.Context.Sources)
+	}
+}
+
+// 全库标识：请求传 "all"，响应带 all_bases / base_count。
+func TestSearchAllBases(t *testing.T) {
+	var gotBody map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"query":      "保修期",
+			"mode":       "hybrid",
+			"results":    []any{},
+			"all_bases":  true,
+			"base_count": 3,
+			"total_ms":   40,
+		}))
+	})
+
+	res, err := c.Search(context.Background(), &SearchRequest{
+		Query: "保修期", KBIDs: []string{AllBases},
+	})
+	if err != nil {
+		t.Fatalf("检索失败: %v", err)
+	}
+
+	// SDK 只传字面 "all"，不自己列库展开——展开是服务端的事，
+	// 否则客户端与服务端看到的库集合可能不一致。
+	ids, _ := gotBody["kb_ids"].([]any)
+	if len(ids) != 1 || ids[0] != "all" {
+		t.Errorf("kb_ids = %v, 期望 [\"all\"]", gotBody["kb_ids"])
+	}
+
+	if !res.AllBases {
+		t.Error("AllBases 应为 true，否则调用方无法说明'已检索全部库'")
+	}
+	if res.BaseCount != 3 {
+		t.Errorf("BaseCount = %d, 期望 3", res.BaseCount)
+	}
+}
+
+// 普通检索的响应没有这两个字段，默认值不能表示"全库"。
+func TestSearchAllBasesDefaultsFalse(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"query": "q", "mode": "hybrid", "results": []any{},
+		}))
+	})
+
+	res, err := c.Search(context.Background(), &SearchRequest{
+		Query: "q", KBIDs: []string{"kb1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AllBases {
+		t.Error("普通检索不应被标记为 AllBases")
+	}
+	if res.BaseCount != 0 {
+		t.Errorf("普通检索 BaseCount 应为 0，实际 %d", res.BaseCount)
+	}
+}
+
+// 对话路径的 knowledge 信息也要透出 all_bases / base_count。
+func TestChatKnowledgeAllBases(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		env := map[string]any{
+			"success":    true,
+			"request_id": "req_1",
+			"data": map[string]any{
+				"content":       "回答",
+				"finish_reason": "stop",
+				"truncated":     false,
+			},
+			"knowledge": map[string]any{
+				"kb_ids":     []string{"kb1", "kb2", "kb3"},
+				"all_bases":  true,
+				"base_count": 3,
+			},
+		}
+		raw, _ := json.Marshal(env)
+		_, _ = w.Write(raw)
+	})
+
+	res, err := c.Chat(context.Background(), &ChatRequest{
+		Messages: []Message{{Role: "user", Content: "问题"}},
+		KBIDs:    []string{AllBases},
+	})
+	if err != nil {
+		t.Fatalf("对话失败: %v", err)
+	}
+	if res.Knowledge == nil {
+		t.Fatal("knowledge 缺失")
+	}
+	if !res.Knowledge.AllBases || res.Knowledge.BaseCount != 3 {
+		t.Errorf("all_bases/base_count 未解析: %+v", res.Knowledge)
+	}
+	// 展开后不应残留 "all"，调用方拿到的是可直接复用的具体 ID
+	for _, id := range res.Knowledge.KBIDs {
+		if id == AllBases {
+			t.Error("kb_ids 里不应残留 all")
+		}
+	}
+	if len(res.Knowledge.KBIDs) != 3 {
+		t.Errorf("kb_ids 应展开为 3 个，实际 %v", res.Knowledge.KBIDs)
 	}
 }
 

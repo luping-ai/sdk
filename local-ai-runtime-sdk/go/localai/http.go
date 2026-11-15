@@ -180,7 +180,13 @@ type Usage struct {
 
 // KnowledgeInfo 说明本次调用如何使用知识库。
 type KnowledgeInfo struct {
-	KBIDs         []string          `json:"kb_ids"`
+	// KBIDs 是实际检索的知识库。请求传 ["all"] 时这里是展开后的
+	// 具体 ID，不会残留 "all"。
+	KBIDs []string `json:"kb_ids"`
+	// AllBases 表示本次用了 ["all"] 展开，UI 据此说明"已检索全部 N 个库"
+	AllBases bool `json:"all_bases,omitempty"`
+	// BaseCount 是实际参与检索的库数
+	BaseCount     int               `json:"base_count,omitempty"`
 	UsedChunks    int               `json:"used_chunks"`
 	ContextTokens int               `json:"context_tokens"`
 	RetrievalMs   int64             `json:"retrieval_ms"`
@@ -196,6 +202,10 @@ type KnowledgeSource struct {
 	DocumentID string  `json:"document_id"`
 	Source     string  `json:"source,omitempty"`
 	Score      float32 `json:"score"`
+	// 溯源字段。PageStart = 0 表示未知页码。
+	PageStart   int    `json:"page_start,omitempty"`
+	PageEnd     int    `json:"page_end,omitempty"`
+	HeadingPath string `json:"heading_path,omitempty"`
 }
 
 // do 执行一次请求并解析信封。内部处理重试（文档 24.4）。
@@ -388,6 +398,10 @@ func shouldRetry(err error, attempt, maxRetry int) (time.Duration, bool) {
 	default:
 		// input_too_long / invalid_request / unauthorized / quota：
 		// 重试无意义，甚至有害（增加负载）
+		//
+		// chunker_mismatch 也走这里，且**必须**走这里：它是"库内已有
+		// 另一种切法的块"，重试一万次都是同一个结果。调用方需要做的
+		// 是重建索引，那是完全不同的动作。
 		return 0, false
 	}
 }

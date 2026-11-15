@@ -47,10 +47,19 @@ from ._types import (
     Capability,
     ChatRequest,
     ChatResult,
+    DedupCheckRequest,
+    DedupCheckResult,
+    DedupGroupsResult,
+    DedupStats,
+    DiffBlock,
+    DiffChanged,
     DocumentSummary,
+    DupDiff,
+    DupGroup,
     HealthReport,
     ImportRequest,
     ImportResult,
+    IngestChunksRequest,
     KBStat,
     KBSummary,
     KnowledgeBaseRef,
@@ -493,6 +502,8 @@ class Client:
             mode=str(data.get("mode", "")),
             degraded=bool(data.get("degraded", False)),
             note=str(data.get("note", "") or ""),
+            all_bases=bool(data.get("all_bases", False)),
+            base_count=int(data.get("base_count", 0) or 0),
             context=ctx,
             total_ms=int(data.get("total_ms", 0) or 0),
         )
@@ -588,8 +599,70 @@ class Client:
         return [DocumentSummary.from_dict(d)
                 for d in (data.get("documents") or [])]
 
+    def ingest_chunks(
+        self, kb_id: str, req: IngestChunksRequest
+    ) -> ImportResult:
+        """入库已解析、已切好的文本块（解析下沉后的主路径）。
+
+        Runtime 不再解析文档、不再切块。客户端用本地库（PyMuPDF /
+        python-docx / openpyxl / python-pptx）解析并切块，把结果连同
+        结构元数据一起提交。换来的是格式覆盖率从约 70% 接近 100%
+        （含 PPT 与扫描件 OCR），且**页码溯源与标题路径才变得可行**。
+
+        ``import_document`` / ``upload_document`` 对应的服务端端点
+        **已从契约移除**（调用会得到 404）。它们保留在 SDK 里只为让
+        错误信息可读，不要在新代码里用。
+
+        ## ChunkerInfo.version 是必填的运维字段
+
+        它标识切块**算法**，不只是参数。参数相同但算法改了时，参数
+        无法表达"这不是同一种切法"，混用会让用户点来源时页码对不上。
+
+        版本与库内不一致时服务端返回 409 → 抛 ``ErrChunkerMismatch``。
+        **不要重试**（重试必然再失败），正确处理是重建该库索引。
+
+        入库是纯数据库操作（不解析、不向量化），比导入快得多；
+        2000 块通常在一秒内。向量由 ``vectorize()`` 在后台补齐。
+        """
+        if not kb_id:
+            raise APIError(ErrInvalidRequest, message="kb_id 不能为空")
+        if not isinstance(req, IngestChunksRequest):
+            raise APIError(ErrInvalidRequest,
+                           message="req 必须是 IngestChunksRequest")
+        # 与服务端 IngestRequest.Validate 保持一致，让明显错误的请求
+        # 不浪费一次往返；服务端仍会完整校验（两处规则由测试锁定）
+        if not (req.name or "").strip():
+            raise APIError(ErrInvalidRequest, message="name 不能为空")
+        if not (req.file_hash or "").strip():
+            raise APIError(ErrInvalidRequest,
+                           message="file_hash 不能为空（用于同库内去重）")
+        if req.chunker is None:
+            raise APIError(ErrInvalidRequest,
+                           message="chunker 不能为空（含切块器版本）")
+        if not (req.chunker.version or "").strip():
+            raise APIError(ErrInvalidRequest,
+                           message="chunker.version 不能为空"
+                                   "（用于检测切块算法变更）")
+        if not req.chunks:
+            raise APIError(ErrInvalidRequest, message="chunks 不能为空")
+
+        env = self._do(
+            "POST",
+            "/api/v1/knowledge/bases/" + _seg(kb_id) + "/documents/chunks",
+            req.to_wire(), timeout=None)
+        return ImportResult.from_dict(env.get("data") or {})
+
     def import_document(self, kb_id: str, req: ImportRequest) -> ImportResult:
         """导入文档（或更新已有文档）。
+
+        .. deprecated::
+            服务端端点已从契约移除，调用会得到 404。
+            用 :meth:`ingest_chunks` 代替。
+
+        保留方法（而不是删掉）的理由：删掉会让升级后的调用方得到
+        ``AttributeError``，而这比"明确的 404 + 这里写着替代方案"
+        信息量更少。不要在这之上加"本地切块再转发"的兼容层——
+        那等于把解析器搬进 SDK，与 Runtime 侧冻结它的决定冲突。
 
         支持 .txt / .md / .pdf / .docx / .xlsx。
 
@@ -688,6 +761,109 @@ class Client:
         )
         env = self._decode_envelope(raw)
         return ImportResult.from_dict(env.get("data") or {})
+
+    # -- 相似检测（Phase 2）--------------------------------------------
+    #
+    # 三个方法都是只读：检测只"告诉"哪几份看起来是同一份，不替用户
+    # 决定保留哪一份。用户的选择通过已有方法表达：
+    #
+    #     client.delete_document(kb, b)
+    #     client.ingest_chunks(kb, a)
+
+    def dedup_check(
+        self, kb_id: str, req: Optional[DedupCheckRequest] = None
+    ) -> DedupCheckResult:
+        """对指定文档做相似检测，返回分组。
+
+        ## 必须检查 ``pending``
+
+        快路径只对**已有指纹**的文档分组。刚导入的文档可能还没有
+        指纹，它们会出现在 ``pending`` 里——此时"没有重复"这个结论
+        是**不完整的**。要拿到完整结果，传 ``recompute=True``
+        （5000 篇约 10 秒）。
+
+        ## 算法
+
+        64 位 SimHash + 鸽巢分块（4×16 bit）分桶，候选对算汉明距离。
+        阈值按长度分档：< 1k 字 ≤ 2、1k~10k ≤ 3、> 10k ≤ 5。
+
+        分组时会重新校验组内直径：A~B 近、B~C 近但 A~C 不近时不会
+        三个一组（标准并查集会，那是误报）。
+
+        表格文档走结构化比较（表头 + 列数 + 行数 + 行集合相似度），
+        因为纯 SimHash 会把"1 月报表"与"2 月报表"误判为重复。
+        """
+        if not kb_id:
+            raise APIError(ErrInvalidRequest, message="kb_id 不能为空")
+        if req is not None and not isinstance(req, DedupCheckRequest):
+            raise APIError(ErrInvalidRequest,
+                           message="req 必须是 DedupCheckRequest")
+
+        body = req.to_wire() if req is not None else {}
+        env = self._do(
+            "POST",
+            "/api/v1/knowledge/bases/" + _seg(kb_id) + "/dedup/check",
+            body, timeout=None)
+        data = env.get("data") or {}
+        return DedupCheckResult(
+            groups=[DupGroup.from_dict(g) for g in (data.get("groups") or [])],
+            pending=[str(x) for x in (data.get("pending") or [])],
+            stats=DedupStats.from_dict(data.get("stats")),
+            total_ms=int(data.get("total_ms", 0) or 0),
+            task_id=str(data.get("task_id", "") or ""),
+        )
+
+    def dedup_groups(self, kb_id: str) -> DedupGroupsResult:
+        """列出库内已有的相似组（不重新计算）。
+
+        适合页面加载时展示。**必须检查 ``stale``**：为 True 时库里有
+        文档还没参与过检测，结果不完整。
+        """
+        if not kb_id:
+            raise APIError(ErrInvalidRequest, message="kb_id 不能为空")
+
+        env = self._do(
+            "GET",
+            "/api/v1/knowledge/bases/" + _seg(kb_id) + "/dedup/groups")
+        data = env.get("data") or {}
+        return DedupGroupsResult(
+            groups=[DupGroup.from_dict(g) for g in (data.get("groups") or [])],
+            computed_at=int(data.get("computed_at", 0) or 0),
+            stale=bool(data.get("stale", False)),
+            pending_count=int(data.get("pending_count", 0) or 0),
+        )
+
+    def dedup_diff(self, kb_id: str, doc_a: str, doc_b: str) -> DupDiff:
+        """计算两份文档的段落级差异。
+
+        两份文档必须属于同一知识库——跨库比较抛 ``ErrInvalidRequest``，
+        因为不同库的文档本来就不该互相去重（文档 22.9 的隔离要求）。
+
+        对齐方式是 `(ordinal, text_hash)`，与增量更新的判据完全一致，
+        因此"diff 说变了 3 块"与"向量化实际重算 3 块"对得上。
+        """
+        if not kb_id or not doc_a or not doc_b:
+            raise APIError(ErrInvalidRequest,
+                           message="kb_id / doc_a / doc_b 都不能为空")
+        if doc_a == doc_b:
+            raise APIError(ErrInvalidRequest,
+                           message="doc_a 与 doc_b 不能是同一份文档")
+
+        path = ("/api/v1/knowledge/bases/" + _seg(kb_id) + "/dedup/diff"
+                + "?doc_a=" + urllib.parse.quote(doc_a, safe="")
+                + "&doc_b=" + urllib.parse.quote(doc_b, safe=""))
+        env = self._do("GET", path)
+        data = env.get("data") or {}
+        return DupDiff(
+            doc_a=str(data.get("doc_a", "") or ""),
+            doc_b=str(data.get("doc_b", "") or ""),
+            added=[DiffBlock.from_dict(b) for b in (data.get("added") or [])],
+            removed=[DiffBlock.from_dict(b) for b in (data.get("removed") or [])],
+            changed=[DiffChanged.from_dict(c) for c in (data.get("changed") or [])],
+            unchanged=int(data.get("unchanged", 0) or 0),
+            truncated=bool(data.get("truncated", False)),
+        )
+
 
 
 # ---------------------------------------------------------------------------

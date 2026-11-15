@@ -69,8 +69,14 @@ type VectorizeProgress struct {
 	Total   int `json:"total_chunks"`
 	Done    int `json:"embedded_chunks"`
 	Pending int `json:"pending_chunks"`
-	// Stale 是失效向量数（换了 Embedding 模型）
+	// Stale 是失效向量数（换了 Embedding 模型或前缀）
 	Stale int `json:"stale_chunks"`
+	// StaleReason 说明向量为何失效，空表示无已知原因。
+	//
+	// 用户看到 Stale 等于 Total 时唯一的疑问是"为什么"。换模型、
+	// 换前缀、还是系统出错？处理方式相同（重新向量化），但用户
+	// 需要知道发生了什么才愿意去做。
+	StaleReason string `json:"stale_reason,omitempty"`
 	// Model 是当前使用的 Embedding 模型（未配置时为空）
 	Model string `json:"model,omitempty"`
 	// Running 表示后台任务正在执行
@@ -150,6 +156,64 @@ type ImportRequest struct {
 	// 更新时做增量 diff：未变更的切片保留向量，只重新向量化
 	// 变更部分。响应里的 Diff 说明本次改了什么。
 	UpdateDocumentID string `json:"update_document_id,omitempty"`
+}
+
+// IngestChunksRequest 是一次"入库已切好的块"的请求。
+//
+// 字段语义见服务端契约（openapi.yaml 的 IngestChunksRequest）。
+type IngestChunksRequest struct {
+	// Name 是显示名（必填），用于来源卡片
+	Name string `json:"name"`
+	// FileType 仅用于筛选与统计，如 "pdf"。
+	// Runtime 不据此选解析器——它不解析任何东西。
+	FileType string `json:"file_type,omitempty"`
+	// FileHash 是内容的 SHA-256 十六进制串（必填）。
+	// 用于同库内去重与幂等：相同哈希重复提交返回 Duplicate。
+	FileHash string `json:"file_hash"`
+	FileSize int64  `json:"file_size,omitempty"`
+	// ModifiedAt 是源文件修改时间（Unix 秒）
+	ModifiedAt int64 `json:"modified_at,omitempty"`
+	// SourceLabel 是来源的可读描述，只存不解析（可给本地路径）
+	SourceLabel string `json:"source_label,omitempty"`
+	// UpdateDocumentID 非空表示增量更新已有文档
+	UpdateDocumentID string `json:"update_document_id,omitempty"`
+	// Chunker 标识切块算法（必填，Version 不能为空）
+	Chunker ChunkerInfo `json:"chunker"`
+	// Chunks 是已切好的块（必填，最多 2000 项）
+	Chunks []ChunkInput `json:"chunks"`
+}
+
+// ChunkInput 是一个待入库的块。
+type ChunkInput struct {
+	// Ordinal 是块在文档内的序号（0 基），**必须唯一**——
+	// 它是增量 diff 的定位依据。
+	Ordinal int    `json:"ordinal"`
+	Text    string `json:"text"`
+	// PageStart / PageEnd 是页码（1 基）。0 或省略表示未知。
+	PageStart int `json:"page_start,omitempty"`
+	PageEnd   int `json:"page_end,omitempty"`
+	// StartRune / RuneCount 是块在原文中的位置（客户端自洽即可）
+	StartRune int `json:"start_rune,omitempty"`
+	RuneCount int `json:"rune_count,omitempty"`
+	// HeadingPath 是章节路径，如"第三章 保修 > 3.2 期限"。
+	// 超过 512 字符会被服务端截断（按 rune）。
+	HeadingPath string `json:"heading_path,omitempty"`
+	// ChunkType 是块类型：paragraph / heading / table / list / code。
+	// 省略或非法值归一为 paragraph。
+	ChunkType string `json:"chunk_type,omitempty"`
+}
+
+// ChunkerInfo 标识客户端的切块算法。
+//
+// Version **必填**：它标识算法而不只是参数。参数相同但算法改了时，
+// 参数无法表达"这不是同一种切法"，混用会导致页码错位。
+type ChunkerInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	// 以下参数只记录，Runtime 不用来判定
+	TargetChars  int `json:"target_chars,omitempty"`
+	MaxChars     int `json:"max_chars,omitempty"`
+	OverlapChars int `json:"overlap_chars,omitempty"`
 }
 
 // ImportResult 是导入文档的结果。
@@ -325,6 +389,14 @@ func (c *Client) ListDocuments(ctx context.Context, kbID string) ([]DocumentSumm
 
 // Import 导入文档（或更新已有文档）。
 //
+// Deprecated: 服务端端点已从契约移除，调用会得到 404。
+// 用 IngestChunks 代替：客户端解析好、切好的块直达入库。
+//
+// 保留方法（而不是删掉）的理由：删掉会让升级后的调用方得到
+// 编译错误/AttributeError，而这比"明确的 404 + 这里写着替代方案"
+// 信息量更少。不要在这之上加"本地切块再转发"的兼容层——
+// 那等于把解析器搬进 SDK，与 Runtime 侧冻结它的决定直接冲突。
+//
 // 支持的格式：.txt / .md / .pdf / .docx / .xlsx。
 //
 // 幂等：同一知识库内相同内容（SHA-256）只保留一份，重复导入
@@ -343,6 +415,64 @@ func (c *Client) Import(ctx context.Context, kbID string, req *ImportRequest) (*
 
 	env, err := c.do(ctx, "POST",
 		"/api/v1/knowledge/bases/"+url.PathEscape(kbID)+"/documents", req)
+	if err != nil {
+		return nil, err
+	}
+	var out ImportResult
+	if err := unmarshalJSON(env.Data, &out); err != nil {
+		return nil, wrapDecodeErr(err)
+	}
+	return &out, nil
+}
+
+// IngestChunks 入库已解析、已切好的文本块（解析下沉后的主路径）。
+//
+// ## 为什么用它而不是 Import
+//
+// Runtime 不再解析文档、不再切块。客户端用本地库（PyMuPDF /
+// python-docx / openpyxl / python-pptx）解析并切块，把结果连同结构
+// 元数据一起提交。换来的是格式覆盖率从约 70% 接近 100%（含 PPT 与
+// 扫描件 OCR），且**页码溯源与标题路径才变得可行**。
+//
+// Import 与 UploadDocument 对应的服务端端点**已从契约移除**（调用会
+// 得到 404）。它们保留在 SDK 里只为让错误信息可读，不要在新代码里用。
+//
+// ## ChunkerInfo.Version 是必填的运维字段
+//
+// 它标识切块**算法**，不只是参数。参数相同但算法改了（如句末判定
+// 逻辑变化）时，参数无法表达"这不是同一种切法"。混用会让用户点来源
+// 时页码对不上，而系统无法事后区分。
+//
+// 版本与库内不一致时服务端返回 409 → 本方法返回 ErrChunkerMismatch。
+// **不要重试**（重试必然再失败），正确处理是重建该库索引。
+func (c *Client) IngestChunks(ctx context.Context, kbID string,
+	req *IngestChunksRequest) (*ImportResult, error) {
+
+	if kbID == "" {
+		return nil, fmt.Errorf("%w: kb_id 不能为空", ErrInvalidRequest)
+	}
+	if req == nil {
+		return nil, fmt.Errorf("%w: req 不能为空", ErrInvalidRequest)
+	}
+	// 与 IngestRequest.Validate 保持一致的本地预检：让明显错误的请求
+	// 不浪费一次往返（服务端仍会完整校验，两处规则由 test_types 锁定）
+	if strings.TrimSpace(req.Name) == "" {
+		return nil, fmt.Errorf("%w: Name 不能为空", ErrInvalidRequest)
+	}
+	if strings.TrimSpace(req.FileHash) == "" {
+		return nil, fmt.Errorf("%w: FileHash 不能为空（用于同库内去重）",
+			ErrInvalidRequest)
+	}
+	if strings.TrimSpace(req.Chunker.Version) == "" {
+		return nil, fmt.Errorf("%w: Chunker.Version 不能为空（用于检测切块算法变更）",
+			ErrInvalidRequest)
+	}
+	if len(req.Chunks) == 0 {
+		return nil, fmt.Errorf("%w: Chunks 不能为空", ErrInvalidRequest)
+	}
+
+	env, err := c.do(ctx, "POST",
+		"/api/v1/knowledge/bases/"+url.PathEscape(kbID)+"/documents/chunks", req)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +528,9 @@ type UploadRequest struct {
 }
 
 // UploadDocument 上传文件内容并导入（multipart/form-data）。
+//
+// Deprecated: 服务端端点已从契约移除，调用会得到 404。
+// 用 IngestChunks 代替。
 //
 // 与 Import 的区别见 UploadRequest 的说明。两者在服务端走同一条
 // 导入链路，去重、增量 diff、切片的行为完全一致。

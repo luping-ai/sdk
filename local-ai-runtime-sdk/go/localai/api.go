@@ -312,7 +312,15 @@ type ChatRequest struct {
 
 	// ---- 知识库（RAG）----
 
-	// KBIDs 是检索的知识库。空表示不用知识库。
+	// KBIDs 是检索的知识库。
+	//
+	// 三种写法（与 SearchRequest.KBIDs 一致）：
+	//   - 空 / nil：不查知识库，走普通对话
+	//   - 具体 ID 列表：只查这些
+	//   - []string{AllBases}：本实例全部知识库（显式声明）
+	//
+	// 注意对话路径与 /search 的差别：这里**空是合法的**
+	// （普通对话），而 /search 的空会返回 400。
 	KBIDs []string `json:"kb_ids,omitempty"`
 	// KnowledgeQuery 覆盖默认检索查询（默认用最后一条 user 消息）。
 	KnowledgeQuery string `json:"knowledge_query,omitempty"`
@@ -338,6 +346,24 @@ type ChatRequest struct {
 
 // Priority 是任务优先级。
 type Priority string
+
+// AllBases 是 KBIDs / ChatRequest.KBIDs 里的全库标识。
+//
+// 用法：
+//
+//	res, err := client.Search(ctx, localai.SearchRequest{
+//		Query: "保修期多久",
+//		KBIDs: []string{localai.AllBases},
+//	})
+//	// res.AllBases == true, res.BaseCount == 该实例的库数
+//
+// 与"省略 KBIDs"有本质区别：
+//   - 省略 / 空数组 → 服务端返回 400，不会退化为全库
+//   - []string{AllBases} → 服务端展开为全部库，并在响应里留痕
+//
+// 不要与具体 ID 混用（[]string{AllBases, "kb_1"} 会返回 400）：
+// 混用有歧义，服务端不做"或"的猜测。
+const AllBases = "all"
 
 const (
 	// PriorityInteractive 是用户主动触发的交互任务（P0），有预留槽位。
@@ -433,7 +459,12 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResult, error
 // SearchRequest 是知识库检索请求。
 type SearchRequest struct {
 	Query string `json:"query"`
-	// KBIDs 必填。不允许全库检索（文档 22.9 的隔离要求）。
+	// KBIDs 必填，不支持隐式全库检索（文档 22.9 的隔离要求）。
+	//
+	// 三种写法：
+	//   - 具体 ID 列表：只查这些，最多 30 个
+	//   - []string{AllBases}：本实例全部知识库（显式声明）
+	//   - 空 / nil：服务端返回 400，**不会**退化为全库
 	KBIDs []string `json:"kb_ids"`
 	// TopK 是返回条数，0 表示服务端默认（5）。
 	TopK int `json:"top_k,omitempty"`
@@ -458,6 +489,17 @@ type SearchHit struct {
 	// KeywordRank / SemanticRank 说明这条是怎么被召回的
 	KeywordRank  int `json:"keyword_rank,omitempty"`
 	SemanticRank int `json:"semantic_rank,omitempty"`
+
+	// 溯源字段（解析下沉后由客户端提供，Runtime 只透出）
+	//
+	// PageStart = 0 表示未知页码（旧数据或客户端未提供）。
+	// **不要显示成"第 0 页"**。
+	PageStart int `json:"page_start,omitempty"`
+	PageEnd   int `json:"page_end,omitempty"`
+	// HeadingPath 是章节路径，如"第三章 保修 > 3.2 期限"
+	HeadingPath string `json:"heading_path,omitempty"`
+	// ChunkType 是块类型：paragraph / heading / table / list / code
+	ChunkType string `json:"chunk_type,omitempty"`
 }
 
 // SearchResult 是检索结果。
@@ -466,6 +508,10 @@ type SearchResult struct {
 	Mode     string
 	Degraded bool
 	Note     string
+	// AllBases 表示本次请求用了 AllBases 展开
+	AllBases bool
+	// BaseCount 是实际参与检索的库数（仅 AllBases 时非零）
+	BaseCount int
 	// Context 是拼好的 RAG 上下文（仅 BuildContext=true 时非 nil）
 	Context *RAGContext
 	// TotalMs 是检索耗时
@@ -513,6 +559,8 @@ func (c *Client) Search(ctx context.Context, req *SearchRequest) (*SearchResult,
 		Degraded bool        `json:"degraded"`
 		Note     string      `json:"note"`
 		TotalMs  int64       `json:"total_ms"`
+		AllBases bool        `json:"all_bases"`
+		BaseCnt  int         `json:"base_count"`
 		Context  *struct {
 			Text                string            `json:"text"`
 			EstimatedTokens     int               `json:"estimated_tokens"`
@@ -529,11 +577,13 @@ func (c *Client) Search(ctx context.Context, req *SearchRequest) (*SearchResult,
 	}
 
 	out := &SearchResult{
-		Hits:     payload.Results,
-		Mode:     payload.Mode,
-		Degraded: payload.Degraded,
-		Note:     payload.Note,
-		TotalMs:  payload.TotalMs,
+		Hits:      payload.Results,
+		Mode:      payload.Mode,
+		Degraded:  payload.Degraded,
+		Note:      payload.Note,
+		AllBases:  payload.AllBases,
+		BaseCount: payload.BaseCnt,
+		TotalMs:   payload.TotalMs,
 	}
 	if payload.Context != nil {
 		out.Context = &RAGContext{

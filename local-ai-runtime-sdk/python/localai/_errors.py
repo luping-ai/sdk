@@ -63,6 +63,7 @@ class ErrorKind(enum.Enum):
     INPUT_TOO_LONG = "input_too_long"
     MODEL_UNAVAILABLE = "model_unavailable"
     CAPABILITY_UNMET = "capability_unmet"
+    CHUNKER_MISMATCH = "chunker_mismatch"
     NOT_FOUND = "not_found"
     INVALID_REQUEST = "invalid_request"
     TASK_CANCELLED = "task_cancelled"
@@ -83,6 +84,7 @@ ErrClientQuota = ErrorKind.CLIENT_QUOTA
 ErrInputTooLong = ErrorKind.INPUT_TOO_LONG
 ErrModelUnavailable = ErrorKind.MODEL_UNAVAILABLE
 ErrCapabilityUnmet = ErrorKind.CAPABILITY_UNMET
+ErrChunkerMismatch = ErrorKind.CHUNKER_MISMATCH
 ErrNotFound = ErrorKind.NOT_FOUND
 ErrInvalidRequest = ErrorKind.INVALID_REQUEST
 ErrTaskCancelled = ErrorKind.TASK_CANCELLED
@@ -105,6 +107,7 @@ KIND_FOR_CODE: dict[str, ErrorKind] = {
     "resource_limited": ErrResourceLimited,
     "model_unavailable": ErrModelUnavailable,
     "capability_unmet": ErrCapabilityUnmet,
+    "chunker_mismatch": ErrChunkerMismatch,
     "internal_error": ErrRuntimeUnavailable,
 }
 
@@ -117,6 +120,7 @@ _MESSAGES = {
     ErrInputTooLong: "localai: input too long",
     ErrModelUnavailable: "localai: model unavailable",
     ErrCapabilityUnmet: "localai: capability unmet",
+    ErrChunkerMismatch: "localai: chunker version mismatch",
     ErrNotFound: "localai: not found",
     ErrInvalidRequest: "localai: invalid request",
     ErrTaskCancelled: "localai: task cancelled",

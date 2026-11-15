@@ -94,6 +94,18 @@ var (
 	// "关程序没用，得换模型或改配置"——重试必然再次失败。
 	ErrCapabilityUnmet = errors.New("localai: capability unmet")
 
+	// ErrChunkerMismatch 切块器版本与库内不一致。
+	//
+	// **绝不可重试**：重试必然再次失败。正确处理是提示用户重建该
+	// 知识库的索引（逐篇 DeleteDocument 后重新 IngestChunks）。
+	//
+	// 为什么单独一个哨兵而不是归到 ErrInvalidRequest：参数本身没错，
+	// 用户不需要改参数，需要重建索引——这是完全不同的动作，
+	// 混在一起会让调用方给出的引导是错的。
+	//
+	// 注意：这个错误**不在**重试白名单里，见 IsRetryable。
+	ErrChunkerMismatch = errors.New("localai: chunker version mismatch")
+
 	// ErrNotFound 请求的资源不存在（模型、知识库、文档、文件）。
 	//
 	// 与服务端错误码的关系：
@@ -184,6 +196,7 @@ var errorCodeKinds = map[string]error{
 	"resource_limited":      ErrResourceLimited,
 	"model_unavailable":     ErrModelUnavailable,
 	"capability_unmet":      ErrCapabilityUnmet,
+	"chunker_mismatch":      ErrChunkerMismatch,
 	"internal_error":        ErrRuntimeUnavailable,
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -569,5 +570,368 @@ func TestUploadDocumentTranslatesErrors(t *testing.T) {
 		if !strings.Contains(apiErr.Message, "不支持的文件类型") {
 			t.Errorf("服务端文案丢失: %q", apiErr.Message)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 入库已切好的块（IngestChunks）
+// ---------------------------------------------------------------------------
+
+// 请求必须打到新端点，且字段名与契约一致。
+func TestIngestChunksSendsContractFields(t *testing.T) {
+	var got map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/knowledge/bases/kb1/documents/chunks" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"document_id": "d1", "chunk_count": 2,
+			"content_runes": 120, "duplicate": false,
+		}))
+	})
+
+	res, err := c.IngestChunks(context.Background(), "kb1", &IngestChunksRequest{
+		Name: "售后手册", FileType: "pdf", FileHash: "h1",
+		FileSize: 1234, ModifiedAt: 1763000000,
+		SourceLabel: `D:/工作/售后手册.pdf`,
+		Chunker: ChunkerInfo{
+			Name: "localkb-py", Version: "1.0.0",
+			TargetChars: 450, MaxChars: 600, OverlapChars: 54,
+		},
+		Chunks: []ChunkInput{
+			{Ordinal: 0, Text: "本条款适用于……", PageStart: 3, PageEnd: 3,
+				StartRune: 1200, RuneCount: 480,
+				HeadingPath: "第三章 > 3.2", ChunkType: "heading"},
+			{Ordinal: 1, Text: "保修期为两年。", PageStart: 4},
+		},
+	})
+	if err != nil {
+		t.Fatalf("入库失败: %v", err)
+	}
+	if res.ChunkCount != 2 {
+		t.Errorf("响应未解析: %+v", res)
+	}
+
+	// 逐个核对字段名：JSON tag 写错不会编译失败，只会在运行时静默丢失
+	if got["name"] != "售后手册" || got["file_hash"] != "h1" {
+		t.Errorf("基础字段: %v", got)
+	}
+	if got["file_type"] != "pdf" {
+		t.Errorf("file_type = %v", got["file_type"])
+	}
+	if got["source_label"] != `D:/工作/售后手册.pdf` {
+		t.Errorf("source_label 未透传: %v", got["source_label"])
+	}
+
+	chunker, _ := got["chunker"].(map[string]any)
+	if chunker["name"] != "localkb-py" || chunker["version"] != "1.0.0" {
+		t.Errorf("chunker: %v", chunker)
+	}
+	if chunker["target_chars"] != float64(450) {
+		t.Errorf("chunker.target_chars = %v", chunker["target_chars"])
+	}
+
+	chunks, _ := got["chunks"].([]any)
+	if len(chunks) != 2 {
+		t.Fatalf("chunks 数 = %d", len(chunks))
+	}
+	first, _ := chunks[0].(map[string]any)
+	if first["page_start"] != float64(3) || first["page_end"] != float64(3) {
+		t.Errorf("页码未透传: %v", first)
+	}
+	if first["heading_path"] != "第三章 > 3.2" || first["chunk_type"] != "heading" {
+		t.Errorf("溯源字段未透传: %v", first)
+	}
+	if first["start_rune"] != float64(1200) || first["rune_count"] != float64(480) {
+		t.Errorf("位置字段未透传: %v", first)
+	}
+}
+
+// 本地预检：明显错误的请求不该浪费一次往返。
+func TestIngestChunksValidation(t *testing.T) {
+	called := false
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = w.Write(okEnvelope(map[string]any{}))
+	})
+
+	cases := []struct {
+		name string
+		kbID string
+		req  *IngestChunksRequest
+	}{
+		{"空 kb_id", "", &IngestChunksRequest{
+			Name: "a", FileHash: "h", Chunker: ChunkerInfo{Name: "c", Version: "1"},
+			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
+		{"空 req", "kb1", nil},
+		{"空 name", "kb1", &IngestChunksRequest{
+			FileHash: "h", Chunker: ChunkerInfo{Name: "c", Version: "1"},
+			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
+		{"空 file_hash", "kb1", &IngestChunksRequest{
+			Name: "a", Chunker: ChunkerInfo{Name: "c", Version: "1"},
+			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
+		{"空 chunker.version", "kb1", &IngestChunksRequest{
+			Name: "a", FileHash: "h", Chunker: ChunkerInfo{Name: "c"},
+			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
+		{"空 chunks", "kb1", &IngestChunksRequest{
+			Name: "a", FileHash: "h", Chunker: ChunkerInfo{Name: "c", Version: "1"}}},
+	}
+	for _, tc := range cases {
+		_, err := c.IngestChunks(context.Background(), tc.kbID, tc.req)
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("%s: err = %v, want ErrInvalidRequest", tc.name, err)
+		}
+	}
+	if called {
+		t.Error("本地预检失败的请求不应发出")
+	}
+}
+
+// 409 chunker_mismatch 必须映射到专用哨兵，且**不可重试**。
+func TestIngestChunksChunkerMismatch(t *testing.T) {
+	attempts := 0
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write(errEnvelope("chunker_mismatch",
+			"库内为 localkb-py@1.0.0，本次为 2.0.0，需要重建索引", false, 0))
+	})
+
+	_, err := c.IngestChunks(context.Background(), "kb1", &IngestChunksRequest{
+		Name: "a", FileHash: "h",
+		Chunker: ChunkerInfo{Name: "c", Version: "2.0.0"},
+		Chunks:  []ChunkInput{{Ordinal: 0, Text: "x"}},
+	})
+
+	if !errors.Is(err, ErrChunkerMismatch) {
+		t.Fatalf("err = %v, want ErrChunkerMismatch", err)
+	}
+	// 这是最关键的一条：重试必然再失败，只会浪费用户时间
+	if IsRetryable(err) {
+		t.Error("chunker_mismatch 不可重试")
+	}
+	if attempts != 1 {
+		t.Errorf("应只尝试 1 次，实际 %d 次（SDK 不应自动重试）", attempts)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 相似检测（Phase 2）
+// ---------------------------------------------------------------------------
+
+func TestDedupCheckFastPath(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"groups": []any{
+				map[string]any{
+					"id": "dg1", "kind": "similar", "max_hamming": 3,
+					"members": []any{
+						map[string]any{"document_id": "a", "name": "a.pdf",
+							"hamming": 0},
+						map[string]any{"document_id": "b", "name": "b.pdf",
+							"hamming": 3},
+					},
+				},
+			},
+			"pending":  []string{"c"},
+			"total_ms": 25,
+		}))
+	})
+
+	res, err := c.DedupCheck(context.Background(), "kb1", &DedupCheckRequest{
+		DocIDs: []string{"a", "b", "c"},
+	})
+	if err != nil {
+		t.Fatalf("检测失败: %v", err)
+	}
+
+	if gotPath != "/api/v1/knowledge/bases/kb1/dedup/check" {
+		t.Errorf("path = %s", gotPath)
+	}
+	if ids, _ := gotBody["doc_ids"].([]any); len(ids) != 3 {
+		t.Errorf("doc_ids 未透传: %v", gotBody["doc_ids"])
+	}
+
+	if len(res.Groups) != 1 {
+		t.Fatalf("groups = %d", len(res.Groups))
+	}
+	g := res.Groups[0]
+	if g.Kind != "similar" || g.MaxHamming != 3 {
+		t.Errorf("组信息不对: %+v", g)
+	}
+	if len(g.Members) != 2 {
+		t.Fatalf("members = %d", len(g.Members))
+	}
+	// 第一个必须是代表（Hamming = 0）
+	if g.Members[0].DocumentID != "a" || g.Members[0].Hamming != 0 {
+		t.Errorf("代表信息不对: %+v", g.Members[0])
+	}
+	if g.Members[1].Name != "b.pdf" {
+		t.Errorf("成员名 = %q", g.Members[1].Name)
+	}
+
+	// pending 必须能读到——不检查它就会把"还没算指纹"误读成"没有重复"
+	if len(res.Pending) != 1 || res.Pending[0] != "c" {
+		t.Errorf("Pending = %v", res.Pending)
+	}
+	if res.TotalMs != 25 {
+		t.Errorf("TotalMs = %d", res.TotalMs)
+	}
+}
+
+// nil 请求应等价于"检查全库"。
+func TestDedupCheckNilRequest(t *testing.T) {
+	var gotBody map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		_, _ = w.Write(okEnvelope(map[string]any{"groups": []any{}}))
+	})
+
+	if _, err := c.DedupCheck(context.Background(), "kb1", nil); err != nil {
+		t.Fatalf("nil 请求应被接受: %v", err)
+	}
+	if len(gotBody) != 0 {
+		t.Errorf("nil 请求不该带字段: %v", gotBody)
+	}
+}
+
+func TestDedupCheckValidation(t *testing.T) {
+	called := false
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = w.Write(okEnvelope(map[string]any{}))
+	})
+
+	_, err := c.DedupCheck(context.Background(), "", nil)
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("空 kb_id 应报 ErrInvalidRequest，实际 %v", err)
+	}
+	if called {
+		t.Error("本地校验失败不该发请求")
+	}
+}
+
+func TestDedupGroups(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s", r.Method)
+		}
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"groups": []any{
+				map[string]any{
+					"id": "dg1", "kind": "exact", "max_hamming": 0,
+					"members": []any{
+						map[string]any{"document_id": "a", "hamming": 0},
+						map[string]any{"document_id": "b", "hamming": 0},
+					},
+				},
+			},
+			"computed_at":   1763000000,
+			"stale":         true,
+			"pending_count": 4,
+		}))
+	})
+
+	res, err := c.DedupGroups(context.Background(), "kb1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Groups) != 1 || res.Groups[0].Kind != "exact" {
+		t.Errorf("groups = %+v", res.Groups)
+	}
+	if res.ComputedAt != 1763000000 {
+		t.Errorf("ComputedAt = %d", res.ComputedAt)
+	}
+	// stale 是"结果不完整"的信号，必须能读到
+	if !res.Stale || res.PendingCount != 4 {
+		t.Errorf("stale=%v pending=%d", res.Stale, res.PendingCount)
+	}
+}
+
+func TestDedupDiff(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// 查询参数必须正确转义
+		q := r.URL.Query()
+		if q.Get("doc_a") != "a" || q.Get("doc_b") != "b" {
+			t.Errorf("query = %v", q)
+		}
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"doc_a": "a", "doc_b": "b",
+			"added": []any{
+				map[string]any{"ordinal": 5, "preview": "新增"},
+			},
+			"removed": []any{
+				map[string]any{"ordinal": 2, "preview": "删除"},
+			},
+			"changed": []any{
+				map[string]any{"ordinal": 1, "before": "旧", "after": "新"},
+			},
+			"unchanged": 7,
+			"truncated": true,
+		}))
+	})
+
+	d, err := c.DedupDiff(context.Background(), "kb1", "a", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Added) != 1 || d.Added[0].Ordinal != 5 || d.Added[0].Preview != "新增" {
+		t.Errorf("Added = %+v", d.Added)
+	}
+	if len(d.Removed) != 1 || d.Removed[0].Ordinal != 2 {
+		t.Errorf("Removed = %+v", d.Removed)
+	}
+	if len(d.Changed) != 1 || d.Changed[0].Before != "旧" || d.Changed[0].After != "新" {
+		t.Errorf("Changed = %+v", d.Changed)
+	}
+	if d.Unchanged != 7 || !d.Truncated {
+		t.Errorf("Unchanged=%d Truncated=%v", d.Unchanged, d.Truncated)
+	}
+}
+
+func TestDedupDiffValidation(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("校验失败不该发请求")
+	})
+
+	cases := []struct{ kb, a, b string }{
+		{"", "a", "b"},
+		{"kb1", "", "b"},
+		{"kb1", "a", ""},
+		{"kb1", "a", "a"}, // 自己比自己没有信息量
+	}
+	for _, tc := range cases {
+		if _, err := c.DedupDiff(context.Background(), tc.kb, tc.a, tc.b); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("(%q,%q,%q) 应报 ErrInvalidRequest，实际 %v",
+				tc.kb, tc.a, tc.b, err)
+		}
+	}
+}
+
+// DupGroup.Summary 用于日志与 UI，格式必须稳定可读。
+func TestDupGroupSummary(t *testing.T) {
+	g := DupGroup{
+		Kind: "similar", MaxHamming: 3,
+		Members: []DupMember{
+			{DocumentID: "a", Name: "合同.pdf"},
+			{DocumentID: "b", Name: "合同(1).pdf"},
+		},
+	}
+	s := g.Summary()
+	if !strings.Contains(s, "similar") || !strings.Contains(s, "合同.pdf") ||
+		!strings.Contains(s, "2 份") {
+		t.Errorf("Summary = %q", s)
+	}
+	// 没有 Name 时退回 DocumentID
+	g2 := DupGroup{Kind: "exact", Members: []DupMember{{DocumentID: "x"}}}
+	if !strings.Contains(g2.Summary(), "x") {
+		t.Errorf("无名称时应显示 ID: %q", g2.Summary())
 	}
 }

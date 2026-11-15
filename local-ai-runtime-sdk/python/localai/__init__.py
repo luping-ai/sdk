@@ -43,6 +43,7 @@ from ._discovery import Discovery, DiscoveryPath, discover
 from ._errors import (
     APIError,
     ErrCapabilityUnmet,
+    ErrChunkerMismatch,
     ErrClientQuota,
     ErrInputTooLong,
     ErrInvalidRequest,
@@ -59,14 +60,27 @@ from ._errors import (
 )
 from ._stream import StreamEvent, StreamEventType
 from ._types import (
+    ALL_BASES,
     Capability,
     ChatRequest,
     ChatResult,
     CheckResult,
+    ChunkerInfo,
+    ChunkInput,
+    DedupCheckRequest,
+    DedupCheckResult,
+    DedupGroupsResult,
+    DedupStats,
+    DiffBlock,
+    DiffChanged,
     DocumentSummary,
+    DupDiff,
+    DupGroup,
+    DupMember,
     HealthReport,
     ImportRequest,
     ImportResult,
+    IngestChunksRequest,
     KBStat,
     KBSummary,
     KnowledgeBaseRef,
@@ -89,6 +103,8 @@ from ._types import (
 __version__ = "0.1.0"
 
 __all__ = [
+    # 常量
+    "ALL_BASES",
     # 错误
     "APIError",
     # 类型
@@ -96,14 +112,27 @@ __all__ = [
     "ChatRequest",
     "ChatResult",
     "CheckResult",
+    "ChunkInput",
+    "ChunkerInfo",
     # 客户端
     "Client",
     "Config",
+    # 相似检测
+    "DedupCheckRequest",
+    "DedupCheckResult",
+    "DedupGroupsResult",
+    "DedupStats",
+    "DiffBlock",
+    "DiffChanged",
     # 发现
     "Discovery",
     "DiscoveryPath",
     "DocumentSummary",
+    "DupDiff",
+    "DupGroup",
+    "DupMember",
     "ErrCapabilityUnmet",
+    "ErrChunkerMismatch",
     "ErrClientQuota",
     "ErrInputTooLong",
     "ErrInvalidRequest",
@@ -118,6 +147,7 @@ __all__ = [
     "HealthReport",
     "ImportRequest",
     "ImportResult",
+    "IngestChunksRequest",
     "KBStat",
     "KBSummary",
     "KnowledgeBaseRef",

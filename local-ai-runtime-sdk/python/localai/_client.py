@@ -67,6 +67,7 @@ from ._types import (
     Model,
     ModelInfo,
     RAGContext,
+    ResourceStatus,
     SearchHit,
     SearchRequest,
     SearchResult,
@@ -302,6 +303,46 @@ class Client:
         env = self._do("GET", "/api/v1/capability",
                        timeout=self._timeouts.connect)
         return Capability.from_dict(env.get("data") or {})
+
+    def resources(self) -> ResourceStatus:
+        """当前的实时资源状态（压力等级、可用内存、占用者）。
+
+        ## 与 capability() 不是一回事
+
+        ``capability()`` 是**启动时算一次的快照**，回答"这台机器能做什么"；
+        本方法每次调用都重新采样，回答"现在有多紧张"。
+
+        两件事都必须能查到：
+
+        - 内存 16 GiB 的机器 capability 永远是 full
+        - 但用户开了虚拟机、导着大 PDF、同时提问时 pressure 会到 CRITICAL
+
+        所以"资源紧张时暂停扫描"只能用本方法判断，用 ``capability()``
+        永远看不出来。
+
+        ## 典型用法
+
+        ::
+
+            st = client.resources()
+            if st.pressure == "CRITICAL":
+                pause_scan()          # 别撞 OOM
+            elif st.pressure == "BUSY":
+                sleep(2)              # 让一步再继续
+
+        ## 这不是一个"要不要发请求"的开关
+
+        Runtime 自己会在准入时拦下放不下的请求并返回
+        ``ErrResourceLimited``——本方法是让你**提前让路**，减少那次无谓的
+        往返与 OOM 风险，不是替代它。因此收到 ``ErrResourceLimited`` 时
+        仍应按原有逻辑退避。
+
+        ``capability`` 与 ``idle`` 可能为 None：未启用推理的部署没有
+        能力评估，也没有需要卸载的模型。
+        """
+        env = self._do("GET", "/api/v1/resources",
+                       timeout=self._timeouts.connect)
+        return ResourceStatus.from_dict(env.get("data") or {})
 
     # -- 模型 ----------------------------------------------------------
 
@@ -630,9 +671,16 @@ class Client:
             raise APIError(ErrInvalidRequest,
                            message="req 必须是 IngestChunksRequest")
         # 与服务端 IngestRequest.Validate 保持一致，让明显错误的请求
-        # 不浪费一次往返；服务端仍会完整校验（两处规则由测试锁定）
-        if not (req.name or "").strip():
-            raise APIError(ErrInvalidRequest, message="name 不能为空")
+        # 不浪费一次往返；服务端仍会完整校验（两处规则由测试锁定）。
+        #
+        # name 只在**新建**时必填：更新时可以省略，语义是"不改显示名"。
+        # 桌面端两个真实场景都走这条路——只改了文件内容、或只移动了
+        # 文件而文件名没变。强制必填会逼调用方先 GET 一次拿旧名再回传，
+        # 而那次回传与"真的改名"在服务端无法区分。
+        if not (req.update_document_id or "").strip() \
+                and not (req.name or "").strip():
+            raise APIError(ErrInvalidRequest,
+                           message="name 不能为空（新建文档时必须给出显示名）")
         if not (req.file_hash or "").strip():
             raise APIError(ErrInvalidRequest,
                            message="file_hash 不能为空（用于同库内去重）")

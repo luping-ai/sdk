@@ -770,7 +770,7 @@ def test_ingest_chunks_validation_local():
                                      chunks=[ChunkInput(0, "x")])),
             ("kb1", IngestChunksRequest(name="", file_hash="h",
                                         chunker=ChunkerInfo("c", "1"),
-                                        chunks=[ChunkInput(0, "x")])),
+                                        chunks=[ChunkInput(0, "x")])),  # 新建：必填
             ("kb1", IngestChunksRequest(name="a", file_hash="",
                                         chunker=ChunkerInfo("c", "1"),
                                         chunks=[ChunkInput(0, "x")])),
@@ -790,6 +790,62 @@ def test_ingest_chunks_validation_local():
             assert ei.value.kind is ErrInvalidRequest
 
     assert not called, "本地预检失败的请求不应发出"
+
+
+def test_ingest_chunks_update_allows_empty_name():
+    """更新时 name 可以省略，且不会被发到服务端。
+
+    语义是"不改显示名"。桌面端两个常规场景都会走到：只改了文件内容、
+    或只移动了文件而文件名没变。若本地预检强制必填，调用方只能先 GET
+    一次拿旧名再回传——而那次回传与"真的改名"在服务端无法区分。
+
+    同时验证 to_wire 的 omitempty 行为：发空串会让请求看起来像
+    "要把名字清空"。
+    """
+    sent = {}
+
+    def handler(req):
+        import json as _json
+        sent.update(_json.loads(req["body"]))
+        return envelope({"document_id": "d1", "chunk_count": 1})
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks", handler)
+        res = _client(rt).ingest_chunks("kb1", IngestChunksRequest(
+            name="",                       # 不改名
+            file_hash="h-rename",
+            update_document_id="d1",
+            chunker=ChunkerInfo("localkb-py", "1.0.0"),
+            chunks=[ChunkInput(0, "内容")],
+        ))
+
+    assert res.document_id == "d1"
+    assert "name" not in sent, f"空 name 不该出现在请求体里: {sent}"
+    assert sent["update_document_id"] == "d1"
+
+
+def test_ingest_chunks_update_sends_new_name():
+    """改名时新名字必须发出去（否则服务端无从知道要改）。"""
+    sent = {}
+
+    def handler(req):
+        import json as _json
+        sent.update(_json.loads(req["body"]))
+        return envelope({"document_id": "d1", "chunk_count": 1})
+
+    with FakeRuntime() as rt:
+        rt.on("POST", "/api/v1/knowledge/bases/kb1/documents/chunks", handler)
+        _client(rt).ingest_chunks("kb1", IngestChunksRequest(
+            name="合同_终稿.docx",
+            file_hash="h-rename",
+            update_document_id="d1",
+            source_label="D:/docs/合同_终稿.docx",
+            chunker=ChunkerInfo("localkb-py", "1.0.0"),
+            chunks=[ChunkInput(0, "内容")],
+        ))
+
+    assert sent["name"] == "合同_终稿.docx"
+    assert sent["source_label"] == "D:/docs/合同_终稿.docx"
 
 
 def test_ingest_chunks_chunker_mismatch_not_retryable():

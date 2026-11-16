@@ -36,8 +36,10 @@ __all__ = [
     "ChatRequest",
     "ChatResult",
     "CheckResult",
+    "Consumer",
     "DocumentSummary",
     "HealthReport",
+    "IdleStatus",
     "ImportRequest",
     "ImportResult",
     "KBStat",
@@ -51,6 +53,9 @@ __all__ = [
     "Priority",
     "Quality",
     "RAGContext",
+    "ResourceAction",
+    "ResourceAdvice",
+    "ResourceStatus",
     "SearchHit",
     "SearchRequest",
     "SearchResult",
@@ -454,6 +459,24 @@ class HealthReport:
     reason: str = ""
     checks: dict[str, CheckResult] = field(default_factory=dict)
 
+    schema_version: int = 0
+    """知识库存储的 schema 版本（**不是** Runtime 的构建版本）。
+
+    客户端据此判断"当前连着的这个 Runtime 支持到什么程度"：
+
+    ========  =====================================================
+    值        能力
+    ========  =====================================================
+    < 2       无 ``documents/chunks``，任何导入都 404，只能只读浏览
+    >= 2      含溯源四列与 ``documents/chunks``（可导入、可按页溯源）
+    >= 3      含相似检测三表与三个只读端点
+    >= 4      含表格结构化指纹
+    ========  =====================================================
+
+    **0 表示对端没有这个字段**（旧版 Runtime），应视为"未知/过旧"，
+    而不是"版本 0 且不支持任何东西"之外的第三种含义。
+    """
+
     @property
     def ready(self) -> bool:
         """是否可以发起推理请求。
@@ -473,6 +496,7 @@ class HealthReport:
             reason=str(d.get("reason", "") or ""),
             checks={k: CheckResult.from_dict(v)
                     for k, v in (d.get("checks") or {}).items()},
+            schema_version=int(d.get("schema_version", 0) or 0),
         )
 
 
@@ -509,6 +533,17 @@ class Capability:
     warnings: list[str] = field(default_factory=list)
     """需要展示给用户的提示，不要静默丢弃。"""
 
+    schema_version: int = 0
+    """知识库存储的 schema 版本，与 :attr:`HealthReport.schema_version`
+    同源同值（能力映射表见那里）。
+
+    两处都给的理由：客户端启动时通常只查 capability 决定功能开关，
+    不会再去查健康报告；而"能加载什么模型"与"能导入什么、能不能
+    溯源"是同一个启动判断。
+
+    0 表示对端没有这个字段（旧版 Runtime）。
+    """
+
     @classmethod
     def from_dict(cls, d: dict) -> Capability:
         return cls(
@@ -520,13 +555,240 @@ class Capability:
             baseline_need_bytes=int(d.get("baseline_need_bytes", 0) or 0),
             rag_model=str(d.get("rag_model", "") or ""),
             warnings=[str(w) for w in (d.get("warnings") or [])],
+            schema_version=int(d.get("schema_version", 0) or 0),
+        )
+
+
+@dataclass
+class Consumer:
+    """一个占用内存的其他程序。
+
+    Runtime 自身已从列表里排除——把"自己"算进"谁占了内存"会让用户
+    去关掉一个不该关的东西。
+    """
+
+    pid: int = 0
+    name: str = ""
+    bytes: int = 0
+    readable: str = ""
+    """人类可读的占用（"1.2 GiB"）。服务端算好的，不要自己再格式化一遍
+    ——两边格式不一致会让用户以为看到了两个不同的数字。"""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Consumer:
+        return cls(
+            pid=int(d.get("pid", 0) or 0),
+            name=str(d.get("name", "") or ""),
+            bytes=int(d.get("bytes", 0) or 0),
+            readable=str(d.get("readable_size", "") or ""),
+        )
+
+
+@dataclass
+class ResourceAction:
+    """一条行动建议。"""
+
+    kind: str = ""
+    text: str = ""
+    detail: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ResourceAction:
+        return cls(
+            kind=str(d.get("kind", "") or ""),
+            text=str(d.get("text", "") or ""),
+            detail=str(d.get("detail", "") or ""),
+        )
+
+
+@dataclass
+class ResourceAdvice:
+    """给用户的行动建议。
+
+    **只在值得提示时出现**（压力等级 ≥ LIMITED）。资源充足时为 None——
+    一堆"关闭其他程序"的建议纯属打扰。
+    """
+
+    message: str = ""
+    actions: list[ResourceAction] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> Optional[ResourceAdvice]:
+        if not d:
+            return None
+        return cls(
+            message=str(d.get("message", "") or ""),
+            actions=[ResourceAction.from_dict(a)
+                     for a in (d.get("actions") or [])],
+        )
+
+
+@dataclass
+class IdleStatus:
+    """空闲卸载的当前状态。
+
+    ## 卸载需要两个条件同时满足
+
+    1. 模型空闲 ≥ ``unload_after_seconds``
+    2. 用户空闲 ≥ ``user_idle_after_seconds``
+
+    只有第一条不够：模型空闲（没人调用）不等于用户离开。用户可能正
+    开着文档准备提问，此时卸载会让他在下次点击时等重新加载。
+
+    ## 必须展示 ``user_idle_detectable`` 与 ``last_reason``
+
+    用户看到"模型一直不卸载"时会怀疑功能失效。看到
+    ``user_idle_detectable=False`` 才能明白是平台不支持，而不是配置错了。
+    """
+
+    enabled: bool = False
+    """自动卸载是否生效（有模型加载且阈值 > 0）。"""
+
+    model_idle_seconds: int = 0
+    """模型已空闲秒数（距最后一次推理）。"""
+
+    unload_after_seconds: int = 0
+    user_idle_after_seconds: int = 0
+
+    user_idle_detectable: bool = False
+    """平台是否支持检测用户活动。
+
+    **为 False 时自动卸载永不触发**（保守策略：判断不了就当作用户在忙）。
+    Linux / macOS 当前为 False。
+    """
+
+    user_idle_seconds: int = 0
+    user_idle_source: str = ""
+    """检测来源说明。Windows 为 ``GetLastInputInfo``；
+    不支持时给出原因（如 ``no graphical session (HEADLESS)``）。"""
+
+    last_reason: str = ""
+    """最近一次判断的依据，回答"为什么没卸载"。
+
+    典型值：``model still recently used (15s)``、``user is active (2s)``、
+    ``user activity unknown, keeping model loaded``。
+    """
+
+    unloads_total: int = 0
+    """累计因空闲而卸载的次数。"""
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> Optional[IdleStatus]:
+        if not d:
+            return None
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            model_idle_seconds=int(d.get("model_idle_seconds", 0) or 0),
+            unload_after_seconds=int(d.get("unload_after_seconds", 0) or 0),
+            user_idle_after_seconds=int(
+                d.get("user_idle_after_seconds", 0) or 0),
+            user_idle_detectable=bool(d.get("user_idle_detectable", False)),
+            user_idle_seconds=int(d.get("user_idle_seconds", 0) or 0),
+            user_idle_source=str(d.get("user_idle_source", "") or ""),
+            last_reason=str(d.get("last_reason", "") or ""),
+            unloads_total=int(d.get("unloads_total", 0) or 0),
+        )
+
+
+@dataclass
+class ResourceStatus:
+    """当前资源占用状态。
+
+    ## 与 :meth:`Client.capability` 的分工
+
+    ==========================  ==================================
+    方法                        回答什么
+    ==========================  ==================================
+    ``capability()``            这台机器**能做什么**（启动时确定）
+    ``resources()``             **现在有多紧张**（每次调用重新采样）
+    ==========================  ==================================
+
+    两者不可互相替代：能力是快照，压力是实时值。内存 16 GiB 的机器
+    capability 永远是 full，但用户开了虚拟机之后 pressure 会变成 CRITICAL。
+
+    ## 典型用法
+
+    ::
+
+        st = client.resources()
+        if st.pressure in ("BUSY", "CRITICAL"):
+            # 暂停扫描、提示用户，而不是撞一个 resource_limited 再退
+            ...
+
+    自动重试不覆盖这个判断：``resource_limited`` 的重试是"再试一次看看"，
+    而主动让路是"现在别做，等用户腾出内存"。
+    """
+
+    pressure: str = ""
+    """压力等级：``NORMAL`` / ``LIMITED`` / ``BUSY`` / ``CRITICAL``。
+
+    用大写枚举而不是 low/medium/high：与 ``/api/v1/resources`` 的原始
+    值一致，避免"SDK 小写、服务端大写"的两套词汇。
+    """
+
+    available_bytes: int = 0
+    total_bytes: int = 0
+
+    available_percent: int = 0
+    """可用百分比（0~100 的整数）。"""
+
+    reason: str = ""
+    """一句话说明为何是该等级。"""
+
+    consumers: list[Consumer] = field(default_factory=list)
+    """占用内存最多的其他程序（已排除 Runtime 自身）。"""
+
+    advice: Optional[ResourceAdvice] = None
+    """行动建议。仅压力 ≥ LIMITED 时出现。"""
+
+    enforcement: str = ""
+    """引擎内存限额的实际状态：``enforced`` / ``soft_only`` / ``disabled``。"""
+
+    enforcement_note: str = ""
+
+    capability: Optional[Capability] = None
+    """这台机器能做什么。None 表示未评估（未启用推理的部署）。
+
+    与 :meth:`Client.capability` 是同一个结构。内嵌在这里是为了让
+    状态栏一次请求就能同时拿到"紧张程度"与"能用什么"。
+    """
+
+    idle: Optional[IdleStatus] = None
+    """空闲卸载状态。None 表示未启用推理或未配置。"""
+
+    @property
+    def strained(self) -> bool:
+        """是否已到需要让路的程度（``LIMITED`` 及以上）。
+
+        判据是"服务端自己会不会降级"，而不是另设一个阈值——两边各定
+        一套必然不同步。需要更细的判断（比如只在 BUSY 才暂停扫描）
+        就直接比较 ``pressure``。
+        """
+        return self.pressure in ("LIMITED", "BUSY", "CRITICAL")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ResourceStatus:
+        cap = d.get("capability")
+        return cls(
+            pressure=str(d.get("pressure", "") or ""),
+            available_bytes=int(d.get("available_bytes", 0) or 0),
+            total_bytes=int(d.get("total_bytes", 0) or 0),
+            available_percent=int(d.get("available_percent", 0) or 0),
+            reason=str(d.get("reason", "") or ""),
+            consumers=[Consumer.from_dict(c)
+                       for c in (d.get("consumers") or [])],
+            advice=ResourceAdvice.from_dict(d.get("advice")),
+            enforcement=str(d.get("enforcement", "") or ""),
+            enforcement_note=str(d.get("enforcement_note", "") or ""),
+            capability=Capability.from_dict(cap)
+            if isinstance(cap, dict) else None,
+            idle=IdleStatus.from_dict(d.get("idle")),
         )
 
 
 @dataclass
 class Model:
     """模型清单的对外视图。"""
-
     id: str = ""
     name: str = ""
     type: str = ""
@@ -1033,7 +1295,14 @@ class IngestChunksRequest:
     """
 
     name: str
-    """显示名（必填），用于来源卡片。"""
+    """显示名，用于来源卡片。
+
+    **新建时必填**；``update_document_id`` 非空时可以留空，语义是
+    "不改显示名"。桌面端的两个常规场景都会用到这个语义：只改了文件
+    内容、或只移动了文件而文件名没变。
+
+    传空串与"省略"等价（dataclass 的位置参数顺序决定了它不能省略）。
+    """
 
     file_hash: str
     """内容的 SHA-256 十六进制串（必填）。同库内去重与幂等的依据。"""
@@ -1059,10 +1328,14 @@ class IngestChunksRequest:
 
     def to_wire(self) -> dict:
         out: dict = {
-            "name": self.name,
             "file_hash": self.file_hash,
             "chunks": [c.to_wire() for c in self.chunks],
         }
+        # name 为空时不发（而不是发空串）：SDK 的既有约定是"值为空
+        # 就不出现"，服务端把"字段缺失"当默认值。这里更要紧的是
+        # 更新场景——发空串会让日志里的请求看起来像"要把名字清空"。
+        if self.name:
+            out["name"] = self.name
         if self.chunker is not None:
             out["chunker"] = self.chunker.to_wire()
         if self.file_type:

@@ -665,7 +665,7 @@ func TestIngestChunksValidation(t *testing.T) {
 			Name: "a", FileHash: "h", Chunker: ChunkerInfo{Name: "c", Version: "1"},
 			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
 		{"空 req", "kb1", nil},
-		{"空 name", "kb1", &IngestChunksRequest{
+		{"空 name（新建）", "kb1", &IngestChunksRequest{
 			FileHash: "h", Chunker: ChunkerInfo{Name: "c", Version: "1"},
 			Chunks: []ChunkInput{{Ordinal: 0, Text: "x"}}}},
 		{"空 file_hash", "kb1", &IngestChunksRequest{
@@ -685,6 +685,47 @@ func TestIngestChunksValidation(t *testing.T) {
 	}
 	if called {
 		t.Error("本地预检失败的请求不应发出")
+	}
+}
+
+// 更新时 Name 可以省略，且不会被发到服务端。
+//
+// 语义是"不改显示名"。桌面端两个常规场景都会走到：只改了文件内容、
+// 或只移动了文件而文件名没变。若本地预检强制必填，调用方只能先 GET
+// 一次拿旧名再回传——而那次回传与"真的改名"在服务端无法区分。
+//
+// 同时验证 omitempty：发空串会让请求看起来像"要把名字清空"，
+// 服务端虽然用 case when 挡住了，但日志里读起来是错的。
+func TestIngestChunksUpdateAllowsEmptyName(t *testing.T) {
+	var sent map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = body
+		_, _ = w.Write(okEnvelope(map[string]any{
+			"document_id": "d1", "chunk_count": 1,
+		}))
+	})
+
+	res, err := c.IngestChunks(context.Background(), "kb1", &IngestChunksRequest{
+		// Name 留空
+		FileHash:         "h-rename",
+		UpdateDocumentID: "d1",
+		Chunker:          ChunkerInfo{Name: "localkb-py", Version: "1.0.0"},
+		Chunks:           []ChunkInput{{Ordinal: 0, Text: "内容"}},
+	})
+	if err != nil {
+		t.Fatalf("更新时 Name 为空不该报错: %v", err)
+	}
+	if res.DocumentID != "d1" {
+		t.Errorf("DocumentID = %q", res.DocumentID)
+	}
+
+	if _, ok := sent["name"]; ok {
+		t.Errorf("空 Name 不应出现在请求体里: %v", sent)
+	}
+	if sent["update_document_id"] != "d1" {
+		t.Errorf("update_document_id 丢失: %v", sent)
 	}
 }
 

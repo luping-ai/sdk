@@ -145,6 +145,15 @@ paths:
                     properties:
                       status: { type: string, example: alive }
                       uptime_seconds: { type: integer, format: int64 }
+                      schema_version:
+                        type: integer
+                        description: |
+                          知识库存储 schema 版本。与 `/health/ready` 的
+                          `data.schema_version` 同源同值。
+
+                          存活检查也给出版本的用途：客户端在"Runtime 还在
+                          初始化、ready 还是 503"的阶段就能判定契约是否满足，
+                          不必等它就绪才发现版本太旧。
 
   /health/ready:
     get:
@@ -598,39 +607,80 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: "#/components/schemas/DocumentList" }
+    # ------------------------------------------------------------------
+    # 注意：这里**没有** post。
+    #
+    # 旧的 POST /documents（路径导入）与 POST /documents/upload（上传）
+    # 已从契约移除（ADR 0016）：文档解析与切块下沉到客户端，Runtime
+    # 不再读文件字节。代码仍然保留（Go 层可用，CLI 与测试依赖它），
+    # 只是不再对外提供——请求会得到 404。
+    #
+    # 替代端点：POST /documents/chunks（见下）。
+    #
+    # 恢复方法：取消 server.go 里两行注释、在此补回两个 operation、
+    # 去掉 handler 的 Deprecated。三步必须在同一个 commit 内，
+    # 否则 tools/apicheck 会报路由漂移。
+    # ------------------------------------------------------------------
+
+  /api/v1/knowledge/bases/{id}/documents/chunks:
     post:
       tags: [knowledge]
-      summary: 导入文档（或更新已有文档）
-      operationId: importDocument
+      summary: 入库已切好的文本块（解析下沉后的主路径）
+      operationId: ingestChunks
       description: |
-        ## 支持的格式
+        ## 为什么是这个形状
 
-        `.txt` / `.md` / `.pdf` / `.docx` / `.xlsx`
-
-        不支持：`.doc` / `.xls` / `.pptx`（旧二进制或结构不同）。
+        Runtime 不再解析文档、不再切块。客户端用本地库（PyMuPDF /
+        python-docx / openpyxl / python-pptx）解析并切块，把结果连同
+        结构元数据一起提交。换来的是：格式覆盖率从约 70% 接近 100%
+        （含 PPT 与扫描件 OCR），且**页码溯源与标题路径才变得可行**。
 
         ## 幂等
 
-        同一知识库内相同内容（SHA-256）只保留一份。
-        重复导入返回 `duplicate: true` 与已有文档 ID。
-
-        **失败的文档允许重试**：补上密码等修正后重新导入会真正重新解析，
-        而不是被去重逻辑挡住。
+        同一知识库内相同 `file_hash` 只保留一份。重复提交返回
+        `duplicate: true` 与已有文档 ID。
 
         ## 增量更新
 
-        传 `update_document_id` 时更新已有文档而非新建。此时做 diff：
-        未变更的切片保留向量，只重新向量化新增与变更的片段。
+        传 `update_document_id` 时更新已有文档而非新建。此时按
+        `(ordinal, text_hash)` 做 diff：未变更的块保留向量，只重新
+        向量化新增与变更的块。
+
+        ## chunker.version 是必填的运维字段
+
+        它标识**切块算法**，不只是参数。参数相同但算法改了（如句末
+        判定逻辑变化）时，参数无法表达"这不是同一种切法"。混用会让
+        用户点来源时页码对不上、检索分数也不可比，而系统没有任何办法
+        事后区分哪些块是哪个版本切的。
+
+        因此版本与库内不一致时返回 **409 `chunker_mismatch`**，且
+        **不可重试**——正确处理是**删除整个库后重新导入全部文档**。
+
+        （不是"逐篇删除后重新提交"：版本记在知识库级的索引配置里，
+        而该配置在库内已有记录时只比对、不覆盖。删单篇不会清掉它，
+        重导必然再撞 409，用户会陷入死循环。）
+
+        ## 上限
+
+        `chunks` 最多 2000 项、总文本 20 MB。超出的文档应由客户端
+        分批提交（`ordinal` 连续，靠 `update_document_id` 续接）。
+
+        ## Runtime 不做的校验
+
+        - 不验证 `text` 是否真的来自 `name` 所指文件（无法验证）
+        - 不验证块之间 `start_rune` 是否连续（客户端切块器自己负责自洽）
+        - 不验证 `heading_path` 格式（PDF 靠字号、DOCX 靠样式、PPT 靠页标题，
+          产物形态不同，强校验会误伤）
       parameters:
         - $ref: "#/components/parameters/KBID"
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/ImportRequest" }
+            schema: { $ref: "#/components/schemas/IngestChunksRequest" }
       responses:
         "200":
-          description: 导入结果
+          description: 入库结果（与导入共用同一个响应类型）
           content:
             application/json:
               schema:
@@ -643,77 +693,13 @@ paths:
           $ref: "#/components/responses/InvalidRequest"
         "404":
           $ref: "#/components/responses/NotFound"
-
-  /api/v1/knowledge/bases/{id}/documents/upload:
-    post:
-      tags: [knowledge]
-      summary: 上传文档并导入
-      operationId: uploadDocument
-      description: |
-        ## 与路径导入的区别
-
-        `/documents`（JSON + `path`）适合 SDK 与 CLI：Runtime 直接读本机
-        文件，省内存也省带宽。
-
-        本端点用 `multipart/form-data` 接收文件内容，供**管理界面**使用——
-        界面里的用户不该被要求手敲一个绝对路径。两者共用同一条导入链路
-        （解析、切片、去重、增量 diff 的行为完全一致）。
-
-        ## 存储模式
-
-        恒为 `MANAGED`。上传内容先落到临时文件，导入完成后删除；知识库
-        另存一份托管副本用于重建索引。显式传 `EXTERNAL` 会被拒绝（那条
-        记录会指向一个已被删除的临时文件）。
-
-        ## 大小
-
-        请求体上限 110 MiB。单文件上限按格式：PDF 100 MB、
-        DOCX/XLSX 50 MB、纯文本 20 MB（与路径导入相同）。
-
-        ## 幂等
-
-        与路径导入一致：同知识库内内容相同（SHA-256）返回
-        `duplicate: true` 与已有文档 ID。
-      parameters:
-        - $ref: "#/components/parameters/KBID"
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file]
-              properties:
-                file:
-                  type: string
-                  format: binary
-                  description: |
-                    文档内容。文件名（含扩展名）决定解析器选择，
-                    因此必须带上正确的扩展名。
-                name:
-                  type: string
-                  description: 显示名。省略则用上传的文件名。
-                password:
-                  type: string
-                  description: 加密 PDF 的密码，可省略（同路径导入）。
-                update_document_id:
-                  type: string
-                  description: 非空表示更新已有文档（增量 diff）。
-      responses:
-        "200":
-          description: 导入结果
+        "409":
+          description: |
+            切块器版本与库内不一致（`chunker_mismatch`）。
+            **不可重试**——删除该库后重新导入全部文档。
           content:
             application/json:
-              schema:
-                allOf:
-                  - $ref: "#/components/schemas/Envelope"
-                  - type: object
-                    properties:
-                      data: { $ref: "#/components/schemas/ImportResult" }
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "404":
-          $ref: "#/components/responses/NotFound"
+              schema: { $ref: "#/components/schemas/Envelope" }
 
   /api/v1/knowledge/bases/{id}/documents/{docId}:
     delete:
@@ -752,6 +738,175 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # ----------------------------------------------------------------------
+  # 相似检测（Phase 2）。三个端点都是**只读**。
+  #
+  # 检测只"告诉"用户哪几份看起来是同一份，不替用户决定保留哪一份。
+  # 用户的选择通过已有接口表达：
+  #
+  #   选 A 入库、B 不入库 → 什么都不用做（B 本来就没导入）
+  #   已导入 B、想换成 A  → delete_document(B) + ingest_chunks(A)
+  #
+  # 因此没有 apply / move / delete 端点。加这些会让 Runtime 承担
+  # "判断哪份是权威版本"的责任——而那个信息只存在于用户的脑子里。
+  # ----------------------------------------------------------------------
+
+  /api/v1/knowledge/bases/{id}/dedup/check:
+    post:
+      tags: [dedup]
+      summary: 对指定文档做相似检测，返回分组
+      operationId: dedupCheck
+      description: |
+        ## 语义
+
+        `doc_ids` 限定**哪些文档参与分组**，不是"只查这些"——
+        相似是相对的，只给一份文档无法判断它是否重复。
+
+        省略 `doc_ids`（或空数组）= 该库全部文档。
+
+        ## 默认不补算指纹（快路径）
+
+        检测依赖每份文档的 64 位 SimHash 指纹。指纹在文档入库后
+        由检测任务补齐，因此刚导入的文档可能还没有指纹。
+
+        默认 `recompute: false` 时走快路径：只对**已有指纹**的文档
+        分组，并把这些缺席的文档放进 `pending` 返回。
+
+        **必须检查 `pending`**：它非空意味着"结果不完整"。不检查就会
+        把"刚导入的那份还没算指纹"误读成"没有重复"。
+
+        `recompute: true` 会先补算缺失指纹（5000 篇约 10 秒），
+        然后返回完整结果。
+
+        ## 算法
+
+        64 位 SimHash + 鸽巢分块（4×16 bit）分桶，候选对算汉明距离。
+        阈值按文档长度分档：< 1k 字 ≤ 2、1k~10k ≤ 3、> 10k ≤ 5。
+
+        分组时会**重新校验组内直径**：A~B 近、B~C 近但 A~C 不近时
+        不会三个一组（标准并查集会，那是误报）。
+
+        表格文档走结构化比较（表头 + 列数 + 行数 + 行集合相似度），
+        因为纯 SimHash 会把"1 月报表"与"2 月报表"误判为重复。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      requestBody:
+        required: false
+        description: 可以完全省略，等价于 `{"doc_ids":[],"recompute":false}`
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DedupCheckRequest" }
+      responses:
+        "200":
+          description: 分组结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DedupCheckResponse" }
+        "202":
+          description: |
+            `async: true` 时返回。body 含 `task_id`、`status`、
+            `priority: "background"`、`poll_after`。
+            检测在 P3 优先级下运行，用 `GET /api/v1/tasks/{id}` 查进度。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Envelope" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/knowledge/bases/{id}/dedup/groups:
+    get:
+      tags: [dedup]
+      summary: 列出库内已有的相似组
+      operationId: dedupGroups
+      description: |
+        返回**上次检测的结果**（不重新计算）。适合页面加载时展示。
+
+        ## 必须看 `stale`
+
+        `stale: true` 表示库里有文档还没参与过检测（没有指纹），
+        当前结果**不完整**。此时应提示用户"重新检测"，而不是
+        把"没有重复"当真。
+
+        `computed_at` 是上次检测的时间。看到 0 说明从未检测过。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+      responses:
+        "200":
+          description: 相似组列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DedupGroupsResponse" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/knowledge/bases/{id}/dedup/diff:
+    get:
+      tags: [dedup]
+      summary: 两份文档的段落级差异
+      operationId: dedupDiff
+      description: |
+        ## 与文本 diff 的区别
+
+        不说"从 A 到 B 要改哪些行"，而说"这几段只在 A 里、这几段只在 B 里"。
+        用户在这里问的是"差多少、我该留哪一份"，不是要一份编辑脚本。
+
+        ## 对齐方式
+
+        按 `ordinal` 对齐并比较 `text_hash`——与增量更新
+        （`ReplaceChunksIncremental`）的判据**完全一致**。因此
+        "diff 说变了 3 块"与"向量化实际重算 3 块"对得上。
+
+        副作用：段落搬家会被显示为"删了一处 + 加了一处"（而不是
+        "移动"）。从"这份文档改了什么"的角度看，这个描述是准确的。
+
+        ## 上限
+
+        单侧最多返回 200 块预览，超出时 `truncated: true`。
+
+        ## 两份文档必须同库
+
+        跨库比较返回 400：不同知识库的文档本来就不该互相去重
+        （文档 22.9 的隔离要求）。
+      parameters:
+        - $ref: "#/components/parameters/KBID"
+        - name: doc_a
+          in: query
+          required: true
+          schema: { type: string }
+          description: 基准文档 ID
+        - name: doc_b
+          in: query
+          required: true
+          schema: { type: string }
+          description: 对比文档 ID
+      responses:
+        "200":
+          description: 差异
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/DedupDiffResponse" }
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/v1/search:
     post:
       tags: [knowledge]
@@ -760,8 +915,20 @@ paths:
       description: |
         ## 知识库隔离
 
-        `kb_ids` 必填且**不支持全库检索**（文档 22.9）。多库时分别
+        `kb_ids` 必填，**不支持隐式全库检索**（文档 22.9）。多库时分别
         检索再合并——向量索引按库独立载入，无法跨库共享。
+
+        三种写法：
+
+        | `kb_ids` | 含义 |
+        | --- | --- |
+        | `["kb_1","kb_2"]` | 只查这些，最多 30 个 |
+        | `["all"]` | 本实例全部知识库（显式声明）。响应带 `all_bases` / `base_count`；展开后超过 50 个库时 400 |
+        | 缺失或 `[]` | **400**，不退化为全库 |
+
+        `"all"` 与具体 ID 混用（如 `["all","kb_1"]`）返回 400——不做
+        "或"的猜测。全库检索是调用方显式声明的意图，UI 应如实展示
+        "已检索全部 N 个知识库"。
 
         ## 两种通道
 
@@ -1916,6 +2083,16 @@ components:
         kb_ids:
           type: array
           items: { type: string }
+          description: |
+            实际检索的知识库。请求传 `["all"]` 时这里是**展开后的具体 ID**，
+            不会残留 `all`——客户端拿到的是可以直接用于后续调用的标识。
+        all_bases:
+          type: boolean
+          description: |
+            本次请求用了 `["all"]` 展开。前端据此说明"已检索全部 N 个知识库"。
+        base_count:
+          type: integer
+          description: 实际参与检索的库数
         used_chunks: { type: integer }
         context_tokens: { type: integer }
         retrieval_ms: { type: integer, format: int64 }
@@ -1937,6 +2114,17 @@ components:
         document_id: { type: string }
         source: { type: string, description: 文件名 }
         score: { type: number, format: float }
+        page_start:
+          type: integer
+          description: |
+            起始页（1 基）。**0 表示未知**（旧数据或客户端未提供）——
+            客户端应显示"页码未知"，不能显示"第 0 页"。
+        page_end:
+          type: integer
+          description: 结束页。0 表示未知。
+        heading_path:
+          type: string
+          description: 章节路径，用于展示"这段来自哪一节"
 
     HealthReport:
       type: object
@@ -1953,6 +2141,25 @@ components:
         checks:
           type: object
           additionalProperties: { $ref: "#/components/schemas/CheckResult" }
+        schema_version:
+          type: integer
+          description: |
+            知识库存储的 schema 版本，客户端据此判断能力（不是 Runtime
+            的构建版本）。**0 表示对端没有这个字段**（旧版 Runtime），
+            必须当成"未知/过旧"处理。
+
+            | 值 | 能力 |
+            | --- | --- |
+            | < 2 | 无 `documents/chunks`，任何导入都会 404，只能只读浏览 |
+            | >= 2 | 含溯源四列（`page_start` / `page_end` / `heading_path` / `chunk_type`）与 `documents/chunks` |
+            | >= 3 | 含相似检测三表与三个只读端点 |
+            | >= 4 | 含表格结构化指纹（1 月/2 月报表不会误判为重复） |
+
+            刻意不另造一套"契约版本"编号：两套编号必然有一天不同步，
+            届时没人能说清客户端的 3 该对应哪一套。
+
+            同一个值也在 `/api/v1/capability` 的 `schema_version` 与
+            `/health/live` 里出现，三处必须一致。
 
     CheckResult:
       type: object
@@ -2490,7 +2697,16 @@ components:
         pending_chunks: { type: integer }
         stale_chunks:
           type: integer
-          description: 失效向量数（换了 Embedding 模型，待重建）
+          description: 失效向量数（换了 Embedding 模型或前缀，待重建）
+        stale_reason:
+          type: string
+          description: |
+            向量为何失效的可读说明（如"embedding 配置已变更（库内 …，
+            当前 …）"）。空表示无已知原因。
+
+            没有它，用户看到 `stale_chunks` 等于 `chunk_count` 时只能猜：
+            换模型、换前缀、还是系统出错？三种情况的处理相同（重新向量化），
+            但用户需要知道发生了什么才愿意去做。
         model: { type: string }
         running: { type: boolean }
 
@@ -2589,6 +2805,290 @@ components:
           type: string
           example: 变更 1，未变 2
 
+    IngestChunksRequest:
+      type: object
+      required: [file_hash, chunker, chunks]
+      description: |
+        入库已切好的文本块（解析下沉后的主路径，见 ingestChunks）。
+
+        `name` 不列在 `required` 里是因为它**只在新建时必填**：
+        带 `update_document_id` 时可以省略（见该字段的说明）。
+        用 OpenAPI 的条件必填表达不了这个规则，因此写在这里而不是
+        靠 `required` 名单——写成无条件必填会让生成的 SDK 在更新时
+        也强制传名字，而那会掩盖"本次不改名"这一语义。
+      properties:
+        name:
+          type: string
+          description: |
+            显示名，用于来源卡片。
+
+            **新建时必填**（省略会返回 400）；带 `update_document_id`
+            时可以省略，语义是"不改显示名"。
+
+            空串与省略等价：不会被当成"把名字清空"，库里原值保留。
+            桌面端的两个常规场景都会用到这个语义——只改了文件内容、
+            或只移动了文件而文件名没变。
+        file_type:
+          type: string
+          description: |
+            文件类型，如 `pdf` / `docx`。**仅用于筛选与统计**——
+            Runtime 不据此选解析器（它不解析任何东西）。
+        file_hash:
+          type: string
+          description: |
+            内容的 SHA-256 十六进制串。用于同库内去重与幂等：
+            相同哈希重复提交返回 `duplicate: true`。
+        file_size: { type: integer, format: int64 }
+        modified_at:
+          type: integer
+          format: int64
+          description: 源文件修改时间（Unix 秒）
+        source_label:
+          type: string
+          description: |
+            来源的可读描述（客户端可给本地路径）。**只存不解析**，
+            仅用于展示。Runtime 不会按它去读文件。
+        update_document_id:
+          type: string
+          description: |
+            非空表示增量更新已有文档。按 `(ordinal, text_hash)` 做 diff，
+            未变更的块保留向量。
+        chunker:
+          $ref: "#/components/schemas/ChunkerInfo"
+        chunks:
+          type: array
+          minItems: 1
+          maxItems: 2000
+          description: |
+            已切好的块。上限 2000 项、总文本 20 MB——超出的文档应由
+            客户端分批提交。
+          items:
+            $ref: "#/components/schemas/ChunkInput"
+
+    ChunkInput:
+      type: object
+      required: [ordinal, text]
+      properties:
+        ordinal:
+          type: integer
+          description: |
+            块在该文档内的序号（0 基）。**必须唯一**——它是增量 diff
+            的定位依据，重复会导致 400。
+        text: { type: string }
+        page_start:
+          type: integer
+          description: 起始页（1 基）。0 或省略表示未知。
+        page_end:
+          type: integer
+          description: 结束页。0 或省略表示未知。
+        start_rune:
+          type: integer
+          description: 块在原文中的起始字符偏移（客户端自洽即可）
+        rune_count: { type: integer }
+        heading_path:
+          type: string
+          description: |
+            章节路径，如"第三章 保修 > 3.2 期限"。超过 512 字符会被截断
+            （按 rune，不按字节——按字节切会切坏汉字）。
+        chunk_type:
+          type: string
+          enum: [paragraph, heading, table, list, code]
+          description: 块类型。省略或非法值归一为 `paragraph`。
+
+    ChunkerInfo:
+      type: object
+      required: [name, version]
+      description: |
+        客户端切块算法的标识。
+
+        ## 为什么 version 必填
+
+        它不只是参数快照。参数相同但算法改了（如句末判定逻辑变化）时，
+        参数无法表达"这不是同一种切法"。新旧两种切法的块混在同一个库里，
+        用户点来源时页码对不上、检索分数也不可比——而系统没有任何办法
+        事后区分哪些块是哪个版本切的。
+
+        因此版本与库内不一致时返回 409 `chunker_mismatch`，且不可重试。
+        补救方式是**删除整个知识库后重新导入全部文档**——删单篇文档
+        不会清掉库级的切块器版本记录，重导仍然 409。
+      properties:
+        name:
+          type: string
+          example: localkb-py
+        version:
+          type: string
+          example: 1.0.0
+        target_chars:
+          type: integer
+          description: 目标块长（字符）。只记录，Runtime 不用它判定。
+        max_chars: { type: integer }
+        overlap_chars: { type: integer }
+
+    # ------------------------------------------------------------------
+    # 相似检测（Phase 2）
+    # ------------------------------------------------------------------
+
+    DedupCheckRequest:
+      type: object
+      properties:
+        doc_ids:
+          type: array
+          items: { type: string }
+          description: |
+            限定参与分组的文档。省略或空 = 该库全部。
+
+            **注意**：这是"哪些文档参与"，不是"只查这些"——相似是
+            相对的，只给一份文档无法判断它是否重复。
+        recompute:
+          type: boolean
+          default: false
+          description: |
+            为 true 时先补算缺失的指纹（完整但慢，5000 篇约 10 秒）。
+            默认 false 走快路径，缺席的文档在 `pending` 里返回。
+        async:
+          type: boolean
+          default: false
+          description: |
+            为 true 时立即返回 202 + `task_id`，检测在后台以
+            **P3（background）优先级**运行，随后用
+            `GET /api/v1/tasks/{id}` 轮询。
+
+            为什么需要它：全库检测在 5000 篇规模下约 10 秒，且是纯 CPU
+            任务。同步执行会让客户端卡住，更糟的是会与用户提问抢 CPU。
+            走调度器的 P3 后，资源紧张时它会被暂停甚至被 P0 抢占。
+
+            `async: true` 时 `recompute` 无意义（后台模式总会补算）。
+
+    DedupCheckResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/DupGroup" }
+        pending:
+          type: array
+          items: { type: string }
+          description: |
+            还没有指纹、未参与本次检查的文档 ID。
+
+            **非空意味着结果不完整**。不检查它就会把"刚导入的那份
+            还没算指纹"误读成"没有重复"。
+        stats:
+          allOf:
+            - $ref: "#/components/schemas/DedupStats"
+          description: 仅 recompute=true 时有值
+        total_ms: { type: integer, format: int64 }
+
+    DedupStats:
+      type: object
+      properties:
+        scanned: { type: integer }
+        reused: { type: integer }
+        groups: { type: integer }
+        candidates: { type: integer }
+
+    DedupGroupsResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/DupGroup" }
+        computed_at:
+          type: integer
+          format: int64
+          description: |
+            上次检测时间（Unix 秒）。0 表示从未检测过。
+
+            用户需要知道"这个结果是刚算的还是上周的"——看到"没有重复"
+            时要能判断可信度。
+        stale:
+          type: boolean
+          description: |
+            库里有文档还没参与检测，当前结果**不完整**。
+            此时应提示用户重新检测，而不是把"没有重复"当真。
+        pending_count:
+          type: integer
+          description: 没有指纹的文档数（stale=true 时才有意义）
+
+    DupGroup:
+      type: object
+      properties:
+        id:
+          type: string
+          description: |
+            组 ID。全量检测时稳定（同一份数据重复检测得到相同 ID），
+            快路径（check 未 recompute）时是临时的 `tmp_*`，
+            客户端不应依赖后者跨请求稳定。
+        kind:
+          type: string
+          enum: [exact, similar]
+          description: |
+            `exact` = 内容哈希完全相同（sha256 相同）
+            `similar` = SimHash 距离在阈值内
+        max_hamming:
+          type: integer
+          description: 组内成员与代表的最大汉明距离。exact 恒为 0。
+        members:
+          type: array
+          description: |
+            成员列表。**第一个是代表**（hamming = 0）。
+
+            "代表"只是"组内最中间的那份"，不代表它是权威版本——
+            那个决定权在用户。
+          items: { $ref: "#/components/schemas/DupMember" }
+
+    DupMember:
+      type: object
+      properties:
+        document_id: { type: string }
+        name:
+          type: string
+          description: |
+            文档显示名。快路径（check 未 recompute）时为空——
+            客户端可用 document_id 从已有文档列表补上，省一次 join。
+        hamming:
+          type: integer
+          description: 与代表的汉明距离（代表自己为 0）
+
+    DedupDiffResponse:
+      type: object
+      properties:
+        doc_a: { type: string }
+        doc_b: { type: string }
+        added:
+          type: array
+          description: 只在 B 里有的块（B 新增）
+          items: { $ref: "#/components/schemas/DiffBlock" }
+        removed:
+          type: array
+          description: 只在 A 里有的块（A 被删）
+          items: { $ref: "#/components/schemas/DiffBlock" }
+        changed:
+          type: array
+          description: 位置相同（ordinal 相同）但内容变了的块
+          items: { $ref: "#/components/schemas/DiffChanged" }
+        unchanged:
+          type: integer
+          description: 未变的块数
+        truncated:
+          type: boolean
+          description: 结果被截断（单侧超过 200 块预览）
+
+    DiffBlock:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        preview:
+          type: string
+          description: 前 40 个字符（按 rune 截断，换行已替换为空格）
+
+    DiffChanged:
+      type: object
+      properties:
+        ordinal: { type: integer }
+        before: { type: string }
+        after: { type: string }
+
     SearchRequest:
       type: object
       required: [query, kb_ids]
@@ -2598,8 +3098,14 @@ components:
           type: array
           items: { type: string }
           minItems: 1
-          maxItems: 10
-          description: 必填。不支持全库检索（隔离要求）。
+          maxItems: 30
+          description: |-
+            必填。不支持隐式全库检索（隔离要求，文档 22.9）。
+
+            - 具体 ID 列表：最多 30 个
+            - `["all"]`：该实例的全部知识库（显式声明，响应带
+              `all_bases` / `base_count`）。展开后超过 50 个库时返回 400
+            - 与具体 ID 混用（如 `["all","kb_1"]`）返回 400
         top_k: { type: integer, default: 5, maximum: 100 }
         mode:
           type: string
@@ -2624,6 +3130,16 @@ components:
         degraded: { type: boolean }
         note: { type: string }
         total_ms: { type: integer, format: int64 }
+        all_bases:
+          type: boolean
+          description: |
+            本次请求用了 `["all"]` 展开。客户端据此在 UI 上说明
+            "已检索全部 N 个知识库"。仅 all 查询时出现。
+        base_count:
+          type: integer
+          description: |
+            实际参与检索的库数（`["all"]` 展开后或去重后的数量）。
+            仅 all 查询时出现——不改变普通请求的响应形状。
         context: { $ref: "#/components/schemas/RAGContext" }
 
     SearchHit:
@@ -2646,6 +3162,26 @@ components:
         semantic_rank:
           type: integer
           description: 在语义通道的排名（0 表示未命中该通道）
+        page_start:
+          type: integer
+          description: |
+            块起始页（1 基）。**0 表示未知**（旧数据或客户端未提供）——
+            不能显示成"第 0 页"。
+        page_end:
+          type: integer
+          description: 块结束页。0 表示未知。
+        heading_path:
+          type: string
+          description: |
+            章节路径，如"第三章 保修条款 > 3.2 保修期限"。
+            不同解析器（PDF 靠字号、DOCX 靠样式、PPT 靠页标题）产物形态
+            不同，**不要按固定格式解析**，只做展示与传参。
+        chunk_type:
+          type: string
+          enum: [paragraph, heading, table, list, code]
+          description: |
+            块类型。非法值在入库时归一为 paragraph（强校验会误伤不同
+            解析器的产物）。
 
     RAGContext:
       type: object
@@ -2813,6 +3349,17 @@ components:
           description: |-
             需要展示给用户的提示，**不要静默丢弃**。
             例如"内存不足：当前可用 400 MiB，加载最小模型需 1.0 GiB"。
+        schema_version:
+          type: integer
+          description: |-
+            知识库存储的 schema 版本。与 `HealthReport.schema_version`
+            同源同值（见该字段的能力映射表）。
+
+            也在这里给一份的理由：客户端启动时通常只查 capability
+            决定功能开关，不会再去查健康报告；而能力与"能导入哪些格式、
+            能不能溯源"是同一个判断。
+
+            0 表示对端没有这个字段（旧版 Runtime）。
 
     ResourceStatus:
       type: object
@@ -2827,26 +3374,11 @@ components:
         consumers:
           type: array
           description: 占用内存最多的其他程序（已排除 Runtime 自身）
-          items:
-            type: object
-            properties:
-              pid: { type: integer }
-              name: { type: string }
-              bytes: { type: integer, format: int64 }
-              readable_size: { type: string }
+          items: { $ref: "#/components/schemas/Consumer" }
         advice:
-          type: object
+          allOf:
+            - $ref: "#/components/schemas/ResourceAdvice"
           description: 给用户的行动建议（仅压力等级需要警告时返回）
-          properties:
-            message: { type: string }
-            actions:
-              type: array
-              items:
-                type: object
-                properties:
-                  kind: { type: string }
-                  text: { type: string }
-                  detail: { type: string }
         enforcement:
           type: string
           enum: [enforced, soft_only, disabled]
@@ -2923,6 +3455,44 @@ components:
           type: integer
           format: int64
           description: 累计因空闲而卸载的次数
+
+    Consumer:
+      type: object
+      description: |-
+        一个占用内存的其他程序。Runtime 自身已从列表里排除——
+        把"自己"算进"谁占了内存"会让用户去关掉一个不该关的东西。
+      properties:
+        pid: { type: integer }
+        name: { type: string }
+        bytes: { type: integer, format: int64 }
+        readable_size:
+          type: string
+          description: |-
+            人类可读的占用（如 "1.2 GiB"）。
+
+            由服务端算好：客户端自己再格式化一遍会出现两套格式，
+            用户会以为看到了两个不同的数字。
+          example: 1.2 GiB
+
+    ResourceAdvice:
+      type: object
+      description: |-
+        给用户的行动建议。**只在压力等级需要警告时出现**——
+        资源充足时返回一堆"关闭程序"的建议纯属打扰。
+      properties:
+        message: { type: string }
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                description: |-
+                  建议的类型标识，客户端可据此决定图标与后续动作
+                  （如 `close_app` / `degrade_model` / `wait`）。
+              text: { type: string }
+              detail: { type: string }
 
     SubmittedTask:
       type: object

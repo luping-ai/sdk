@@ -162,8 +162,14 @@ type ImportRequest struct {
 //
 // 字段语义见服务端契约（openapi.yaml 的 IngestChunksRequest）。
 type IngestChunksRequest struct {
-	// Name 是显示名（必填），用于来源卡片
-	Name string `json:"name"`
+	// Name 是显示名，用于来源卡片。
+	//
+	// **新建时必填**；UpdateDocumentID 非空时可以留空，语义是
+	// "不改显示名"。桌面端的两个常规场景都会用到——只改了文件内容、
+	// 或只移动了文件而文件名没变。
+	//
+	// 留空时不会被发到服务端（omitempty），因此不会把库里的名字清成空串。
+	Name string `json:"name,omitempty"`
 	// FileType 仅用于筛选与统计，如 "pdf"。
 	// Runtime 不据此选解析器——它不解析任何东西。
 	FileType string `json:"file_type,omitempty"`
@@ -455,9 +461,15 @@ func (c *Client) IngestChunks(ctx context.Context, kbID string,
 		return nil, fmt.Errorf("%w: req 不能为空", ErrInvalidRequest)
 	}
 	// 与 IngestRequest.Validate 保持一致的本地预检：让明显错误的请求
-	// 不浪费一次往返（服务端仍会完整校验，两处规则由 test_types 锁定）
-	if strings.TrimSpace(req.Name) == "" {
-		return nil, fmt.Errorf("%w: Name 不能为空", ErrInvalidRequest)
+	// 不浪费一次往返（服务端仍会完整校验，两处规则由 test_types 锁定）。
+	//
+	// Name 只在**新建**时必填：UpdateDocumentID 非空时可以省略，语义是
+	// "不改显示名"。桌面端的两个常规场景都会用到——只改了文件内容、
+	// 或只移动了文件而文件名没变。强制必填会逼调用方先 GET 一次拿旧名
+	// 再回传，而那次回传与"真的改名"在服务端无法区分。
+	if strings.TrimSpace(req.Name) == "" && req.UpdateDocumentID == "" {
+		return nil, fmt.Errorf("%w: Name 不能为空（新建文档时必须给出显示名）",
+			ErrInvalidRequest)
 	}
 	if strings.TrimSpace(req.FileHash) == "" {
 		return nil, fmt.Errorf("%w: FileHash 不能为空（用于同库内去重）",

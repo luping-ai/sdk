@@ -26,6 +26,15 @@ type HealthReport struct {
 	UptimeSeconds int64                  `json:"uptime_seconds"`
 	Reason        string                 `json:"reason,omitempty"`
 	Checks        map[string]CheckResult `json:"checks,omitempty"`
+	// SchemaVersion 是知识库存储的 schema 版本（**不是** Runtime 的
+	// 构建版本）。客户端据此判断"当前连着的这个 Runtime 支持到什么程度"。
+	//
+	//	>= 2  有溯源四列与 documents/chunks（可导入、可按页溯源）
+	//	>= 3  有相似检测三表与三个只读端点
+	//	>= 4  有表格结构化指纹
+	//
+	// **0 表示对端没有这个字段**（旧版 Runtime），应视为"未知/过旧"。
+	SchemaVersion int `json:"schema_version"`
 }
 
 // CheckResult 是单项检查结果。
@@ -68,6 +77,14 @@ type Capability struct {
 	RAGModel string `json:"rag_model,omitempty"`
 	// Warnings 需要展示给用户的提示，不要静默丢弃。
 	Warnings []string `json:"warnings,omitempty"`
+	// SchemaVersion 是知识库存储的 schema 版本，与
+	// HealthReport.SchemaVersion 同源同值（能力映射见那里的注释）。
+	//
+	// 两处都给的理由：客户端启动时通常只查 Capability 决定功能开关，
+	// 不会再去查健康报告。
+	//
+	// 0 表示对端没有这个字段（旧版 Runtime）。
+	SchemaVersion int `json:"schema_version"`
 }
 
 // Ready 表示可以发起推理请求。

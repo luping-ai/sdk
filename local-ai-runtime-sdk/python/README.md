@@ -243,6 +243,66 @@ except APIError as e:
 
 建议启动时查一次并缓存——能力在 Runtime 启动时确定，不随请求变化。
 
+### 契约版本：`schema_version`
+
+`capability().schema_version`（与 `health().schema_version` 同值）是
+**知识库存储的 schema 版本**，不是 Runtime 的构建版本。客户端据此判断
+"这个 Runtime 支持到什么程度"，而不是靠"调一下看会不会 404"去猜。
+
+| 值 | 能力 |
+| --- | --- |
+| `< 2` | 没有 `documents/chunks`，任何导入都会 404，只能只读浏览 |
+| `>= 2` | 含溯源四列与 `documents/chunks`（可导入、可按页/按节溯源） |
+| `>= 3` | 含相似检测三表与三个只读端点 |
+| `>= 4` | 含表格结构化指纹（1 月/2 月报表不会误判为重复） |
+
+**`0` 表示对端没有这个字段**（旧版 Runtime），必须当成"未知/过旧"处理。
+这种部署上仍可做健康检查与能力查询，只是导入类功能不可用。
+
+为什么值得先查而不是"试一下"：版本不匹配时"试一下"会把一次问题变成
+一堆分散的功能失效，用户看到的是"某个按钮点了没反应"。
+
+---
+
+## 四之二、实时资源：`resources()` 与 `capability()` 不是一回事
+
+`capability()` 是**启动时算一次的快照**，回答"这台机器能做什么"；
+`resources()` 每次调用重新采样，回答"**现在**有多紧张"。
+
+两者不能互相替代。内存 16 GiB 的机器 `capability()` 永远是 `full`，但
+用户开了虚拟机、导着大 PDF、同时提问时 `pressure` 会到 `CRITICAL`。
+
+```python
+st = client.resources()
+
+print(st.pressure)          # NORMAL / LIMITED / BUSY / CRITICAL
+print(st.available_bytes)   # 实时可用内存
+for c in st.consumers:      # 谁占了内存（已排除 Runtime 自身）
+    print(c.readable, c.name)
+```
+
+扫库时按它让路，而不是等撞上 `ErrResourceLimited`：
+
+```python
+if st.pressure == "CRITICAL":
+    pause_scan()            # 别撞 OOM
+elif st.strained:           # LIMITED / BUSY / CRITICAL
+    time.sleep(2)
+```
+
+`strained` 的判据（`LIMITED` 及以上）与服务端开始警告的档位一致——两边
+各定一套阈值必然不同步，表现为"客户端觉得还好，服务端已经在提示用户
+关程序"。
+
+**两个注意点**：
+
+- **不要放进每篇文档的循环里**。一次调用会枚举进程列表，几百次会明显
+  拖慢扫描。按批（50 篇）或按时间（每几秒）查一次。
+- 它不是"要不要发请求"的开关。Runtime 仍会在准入时拦下放不下的请求并
+  返回 `ErrResourceLimited`；`resources()` 让你**提前让路**，减少无谓往返。
+
+`capability` 与 `idle` 可能为 `None`（未启用推理的部署），不要直接取属性。
+
 ---
 
 ## 五、错误：区分"稍后重试"与"不可能成功"

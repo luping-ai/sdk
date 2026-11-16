@@ -184,6 +184,54 @@ cap, err := client.Capability(ctx)
 建议**启动时查一次并缓存**：能力在 Runtime 启动时确定，不随请求变化
 （与 `/resources` 的实时压力不同）。
 
+### 契约版本：`SchemaVersion`
+
+`Capability.SchemaVersion`（与 `HealthReport.SchemaVersion` 同值）是
+**知识库存储的 schema 版本**，不是 Runtime 的构建版本。客户端据此判断
+"这个 Runtime 支持到什么程度"，而不是靠"调一下看会不会 404"去猜。
+
+| 值 | 能力 |
+| --- | --- |
+| `< 2` | 没有 `documents/chunks`，任何导入都会 404，只能只读浏览 |
+| `>= 2` | 含溯源四列与 `documents/chunks`（可导入、可按页/按节溯源） |
+| `>= 3` | 含相似检测三表与三个只读端点 |
+| `>= 4` | 含表格结构化指纹 |
+
+**`0` 表示对端没有这个字段**（旧版 Runtime），应视为"未知/过旧"。
+
+### 实时资源：`Resources` 与 `Capability` 不是一回事
+
+`Capability` 是启动时算一次的快照，`Resources` 每次调用重新采样。内存
+16 GiB 的机器 `Level` 永远是 `full`，但用户开了虚拟机、导着大 PDF 时
+`Pressure` 会到 `CRITICAL`。所以"资源紧张时暂停扫描"只能靠 `Resources`。
+
+```go
+st, err := client.Resources(ctx)
+if err != nil {
+	// 拿不到不致命：退回"撞到 ErrResourceLimited 再退避"
+}
+if st.Pressure == localai.PressureCritical {
+	pauseScan()          // 别撞 OOM
+} else if st.Strained() { // LIMITED 及以上
+	time.Sleep(2 * time.Second)
+}
+for _, c := range st.Consumers {
+	log.Printf("%s 占用 %s", c.Name, c.Readable)
+}
+```
+
+`Strained()` 的判据与服务端开始警告的档位一致——两边各定一套阈值必然
+不同步，表现为"客户端觉得还好，服务端已经在提示用户关程序"。
+
+**两个注意点**：
+
+- **不要放进每篇文档的循环里**。一次调用会枚举进程列表，几百次会明显
+  拖慢扫描。按批（50 篇）或按时间（每几秒）查一次。
+- 它不是"要不要发请求"的开关。Runtime 仍会在准入时拦下放不下的请求并
+  返回 `ErrResourceLimited`；`Resources` 让你**提前让路**，减少无谓往返。
+
+`Capability` 与 `Idle` 可能为 `nil`（未启用推理的部署），取字段前先判空。
+
 `Health` 的语义：
 
 ```go
@@ -681,7 +729,8 @@ SDK 覆盖的端到端映射（契约唯一真相是 `local-ai-runtime-sdk/docs/
 | --- | --- | --- |
 | `Health(ctx)` | `GET /health/ready` | 能否服务 |
 | `Live(ctx)` | `GET /health/live` | 进程存活 |
-| `Capability(ctx)` | `GET /api/v1/capability` | 能做什么 |
+| `Capability(ctx)` | `GET /api/v1/capability` | 能做什么（启动时确定） |
+| `Resources(ctx)` | `GET /api/v1/resources` | 现在有多紧张（每次重新采样） |
 | `Models(ctx)` | `GET /api/v1/models` | 模型清单 |
 | `ActiveModel(ctx)` | `GET /api/v1/models` | 当前模型（读 `active`） |
 | `LoadModel(ctx, id)` | `POST /api/v1/models/load` | 换模型（同步） |
